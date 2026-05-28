@@ -7,9 +7,9 @@
 ```text
 学生问题 + 日志
   ↓
-第一层：AI 审查（相关性 / 硬件风险 / 是否转人工）
+第一层：AI 审查（只判断相关性，可用便宜模型）
   ↓
-第二层：AI 分类（FAQ / 项目 Debug / 泛机器人问题 / 越界）
+第二层：AI 分类（硬件风险 / 是否转人工 / FAQ / 项目 Debug / 越界）
   ↓
 第三层：FAQ / 项目片段检索
   ↓
@@ -34,15 +34,15 @@ topic 没有输出
 摄像头/底盘/IMU 异常
 ```
 
-工具会先判断问题是否机器人售后相关；第一层审查不通过时停止下探。第二层分类后先进入第三层检索，再决定走 FAQ 直接回复，还是进入第四层项目级 Debug。
+工具会先判断问题是否机器人售后相关；第一层审查不通过时停止下探。硬件风险和是否需要人工介入由第二层判断。第二层分类后先进入第三层检索，再决定走 FAQ 直接回复，还是进入第四层项目级 Debug。
 
 ## 当前能力
 
 - 项目文件扫描和只读索引
 - 忽略 `build/`、`devel/`、`install/`、`.git/`、`logs/` 等无关目录
 - 识别 ROS 相关文件类型
-- 第一层 AI 审查
-- 第二层 AI 分类
+- 第一层 AI 相关性审查，可配置便宜模型
+- 第二层 AI 安全判断和分类，可配置更强模型
 - 第三层 FAQ 匹配和项目相关文件检索
 - 第四层项目 Debug 模型提示与回答（按第三层检索结果进入）
 - 生成 Markdown 诊断报告
@@ -153,18 +153,36 @@ python support_ai.py ask `
 
 ```json
 {
-  "api_key": "替换成你的 API Key",
-  "base_url": "https://example.com/api/v1",
-  "model": "your-model-name"
+  "review": {
+    "api_key": "替换成第一层 API Key",
+    "base_url": "https://review-provider.example.com/api/v1",
+    "model": "your-cheap-review-model"
+  },
+  "classification": {
+    "api_key": "替换成第二层 API Key",
+    "base_url": "https://classification-provider.example.com/api/v1",
+    "model": "your-strong-classification-model"
+  },
+  "debug": {
+    "api_key": "替换成第四层 API Key",
+    "base_url": "https://debug-provider.example.com/api/v1",
+    "model": "your-debug-model"
+  }
 }
 ```
 
-也可以用环境变量覆盖：
+每一层可以接不同厂商、不同 Key、不同 Base URL。也可以用环境变量分别覆盖：
 
 ```powershell
-$env:AFTERSALES_AI_API_KEY="你的 API Key"
-$env:AFTERSALES_AI_BASE_URL="https://example.com/api/v1"
-$env:AFTERSALES_AI_MODEL="your-model-name"
+$env:AFTERSALES_REVIEW_AI_API_KEY="第一层 API Key"
+$env:AFTERSALES_REVIEW_AI_BASE_URL="https://review-provider.example.com/api/v1"
+$env:AFTERSALES_REVIEW_AI_MODEL="your-cheap-review-model"
+$env:AFTERSALES_CLASSIFICATION_AI_API_KEY="第二层 API Key"
+$env:AFTERSALES_CLASSIFICATION_AI_BASE_URL="https://classification-provider.example.com/api/v1"
+$env:AFTERSALES_CLASSIFICATION_AI_MODEL="your-strong-classification-model"
+$env:AFTERSALES_DEBUG_AI_API_KEY="第四层 API Key"
+$env:AFTERSALES_DEBUG_AI_BASE_URL="https://debug-provider.example.com/api/v1"
+$env:AFTERSALES_DEBUG_AI_MODEL="your-debug-model"
 ```
 
 `ask` 默认使用 `--triage-mode auto` 调用模型服务完成第一层审查和第二层分类；本地关键词分流已移除，因此必须配置模型服务 Key。显式使用模型服务：

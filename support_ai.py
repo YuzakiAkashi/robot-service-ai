@@ -24,6 +24,26 @@ SCHEMA_VERSION = 1
 LLM_DEFAULT_CONFIG = "ai_config.local.json"
 LLM_DEFAULT_BASE_URL = "https://example.com/api/v1"
 LLM_DEFAULT_MODEL = "your-model-name"
+LLM_API_KEY_ENV_NAMES = ("AFTERSALES_AI_API_KEY", "OPENAI_API_KEY")
+LLM_BASE_URL_ENV_NAMES = ("AFTERSALES_AI_BASE_URL", "OPENAI_BASE_URL")
+LLM_MODEL_ENV_NAMES = ("AFTERSALES_AI_MODEL", "OPENAI_MODEL")
+LLM_LAYER_ENV_NAMES = {
+    "review": {
+        "api_key": ("AFTERSALES_REVIEW_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
+        "base_url": ("AFTERSALES_REVIEW_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
+        "model": ("AFTERSALES_REVIEW_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
+    },
+    "classification": {
+        "api_key": ("AFTERSALES_CLASSIFICATION_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
+        "base_url": ("AFTERSALES_CLASSIFICATION_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
+        "model": ("AFTERSALES_CLASSIFICATION_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
+    },
+    "debug": {
+        "api_key": ("AFTERSALES_DEBUG_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
+        "base_url": ("AFTERSALES_DEBUG_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
+        "model": ("AFTERSALES_DEBUG_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
+    },
+}
 
 IGNORED_DIRS = {
     ".git",
@@ -284,7 +304,12 @@ def is_placeholder_model(value: str) -> bool:
     if not stripped:
         return True
     placeholders = {"YOUR_MODEL_NAME", "your-model-name", "替换成你的模型名"}
-    return stripped in placeholders or "替换" in stripped or "你的" in stripped
+    return (
+        stripped in placeholders
+        or stripped.startswith("your-")
+        or "替换" in stripped
+        or "你的" in stripped
+    )
 
 
 def is_placeholder_base_url(value: str) -> bool:
@@ -295,37 +320,85 @@ def is_placeholder_base_url(value: str) -> bool:
     return stripped in {"https://example.com/api/v1", "your-base-url"} or "example.com" in stripped
 
 
-def load_llm_config(config_path: str | None = None) -> dict[str, Any]:
-    """从本地 JSON 配置和环境变量读取模型服务 API 设置。"""
-    path = Path(config_path or os.getenv("AFTERSALES_AI_CONFIG", LLM_DEFAULT_CONFIG))
-    file_config: dict[str, Any] = {}
-    if path.exists():
-        loaded = load_json(path, default={})
-        if not isinstance(loaded, dict):
-            raise SystemExit(f"AI 配置文件必须是 JSON 对象: {path}")
-        file_config = loaded
+def load_config_object(path: Path, label: str) -> dict[str, Any]:
+    """读取可选 JSON 配置文件，并保证内容是对象。"""
+    if not path.exists():
+        return {}
+    loaded = load_json(path, default={})
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"{label} 配置文件必须是 JSON 对象: {path}")
+    return loaded
 
-    api_key = (
-        os.getenv("AFTERSALES_AI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-        or str(file_config.get("api_key", ""))
-    ).strip()
-    base_url = (
-        os.getenv("AFTERSALES_AI_BASE_URL")
-        or os.getenv("OPENAI_BASE_URL")
-        or str(file_config.get("base_url", LLM_DEFAULT_BASE_URL))
-    ).strip()
-    model = (
-        os.getenv("AFTERSALES_AI_MODEL")
-        or os.getenv("OPENAI_MODEL")
-        or str(file_config.get("model", LLM_DEFAULT_MODEL))
-    ).strip()
+
+def layer_file_config(file_config: dict[str, Any], layer: str | None) -> dict[str, Any]:
+    """合并顶层配置和指定层级配置；层级配置优先。"""
+    merged = {
+        "api_key": file_config.get("api_key", ""),
+        "base_url": file_config.get("base_url", LLM_DEFAULT_BASE_URL),
+        "model": file_config.get("model", LLM_DEFAULT_MODEL),
+    }
+    if not layer:
+        return merged
+    layer_config = file_config.get(layer, {})
+    if layer_config is None:
+        return merged
+    if not isinstance(layer_config, dict):
+        raise SystemExit(f"AI 配置中的 {layer} 必须是 JSON 对象")
+    merged.update({key: value for key, value in layer_config.items() if value is not None})
+    return merged
+
+
+def first_config_value(
+    file_config: dict[str, Any],
+    key: str,
+    env_names: tuple[str, ...],
+    default: str,
+) -> str:
+    """按环境变量、配置文件、默认值的优先级读取字符串配置。"""
+    for env_name in env_names:
+        value = os.getenv(env_name)
+        if value:
+            return value.strip()
+    value = file_config.get(key, default)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def load_llm_config(config_path: str | None = None, layer: str | None = None) -> dict[str, Any]:
+    """从本地 JSON 配置和环境变量读取某一层的模型服务 API 设置。"""
+    path = Path(config_path or os.getenv("AFTERSALES_AI_CONFIG", LLM_DEFAULT_CONFIG))
+    file_config = load_config_object(path, "AI")
+    layer_config = layer_file_config(file_config, layer)
+    env_names = LLM_LAYER_ENV_NAMES.get(
+        layer or "",
+        {
+            "api_key": LLM_API_KEY_ENV_NAMES,
+            "base_url": LLM_BASE_URL_ENV_NAMES,
+            "model": LLM_MODEL_ENV_NAMES,
+        },
+    )
 
     return {
-        "api_key": api_key,
-        "base_url": base_url or LLM_DEFAULT_BASE_URL,
-        "model": model or LLM_DEFAULT_MODEL,
+        "api_key": first_config_value(layer_config, "api_key", env_names["api_key"], ""),
+        "base_url": first_config_value(
+            layer_config,
+            "base_url",
+            env_names["base_url"],
+            LLM_DEFAULT_BASE_URL,
+        ),
+        "model": first_config_value(layer_config, "model", env_names["model"], LLM_DEFAULT_MODEL),
         "config_path": str(path),
+        "layer": layer or "default",
+    }
+
+
+def load_llm_configs(config_path: str | None = None) -> dict[str, dict[str, Any]]:
+    """读取第一层、第二层和第四层的模型配置。"""
+    return {
+        "review": load_llm_config(config_path, "review"),
+        "classification": load_llm_config(config_path, "classification"),
+        "debug": load_llm_config(config_path, "debug"),
     }
 
 
@@ -352,6 +425,14 @@ def llm_provider_name(config: dict[str, Any]) -> str:
     """返回报告中展示的模型名称。"""
     model = str(config.get("model", "")).strip()
     return model or "unknown"
+
+
+def layer_llm_config(configs: dict[str, Any], layer: str) -> dict[str, Any]:
+    """兼容单模型配置和分层模型配置。"""
+    layer_config = configs.get(layer)
+    if isinstance(layer_config, dict):
+        return layer_config
+    return configs
 
 
 def call_llm_chat(
@@ -474,30 +555,18 @@ def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
 
 def first_layer_passed(review: dict[str, Any]) -> bool:
     """判断第一层审查是否允许问题继续进入后续层级。"""
-    hardware_risk = as_bool(review.get("hardware_risk")) or bool(
-        as_string_list(review.get("hardware_risk_keywords"))
-    )
-    return as_bool(review.get("related")) and not hardware_risk and not as_bool(
-        review.get("need_human")
-    )
+    return as_bool(review.get("related"))
 
 
 def build_skipped_classification(review: dict[str, Any]) -> dict[str, Any]:
     """第一层未通过时生成第二层跳过结果，避免继续下探。"""
-    hardware_risk = as_bool(review.get("hardware_risk")) or bool(
-        as_string_list(review.get("hardware_risk_keywords"))
-    )
-    need_human = as_bool(review.get("need_human"))
-    if hardware_risk or need_human:
-        category = "hardware_risk"
-        difficulty = "human_review"
-    else:
-        category = "out_of_scope"
-        difficulty = "ignore_or_manual"
     return {
         "provider": "skipped",
-        "category": category,
-        "difficulty": difficulty,
+        "category": "out_of_scope",
+        "difficulty": "ignore_or_manual",
+        "hardware_risk": False,
+        "need_human": False,
+        "hardware_risk_keywords": [],
         "need_project_context": False,
         "missing_info": [],
         "reason": "第一层审查未通过，未进入第二层分类。",
@@ -521,9 +590,9 @@ def merge_triage_layers(
     allowed_difficulties = {"human_review", "complex", "simple", "medium", "ignore_or_manual"}
 
     related = as_bool(review.get("related"))
-    need_human = as_bool(review.get("need_human"))
-    hardware_risk = as_bool(review.get("hardware_risk"))
-    hardware_risk_keywords = as_string_list(review.get("hardware_risk_keywords"))
+    need_human = as_bool(classification.get("need_human"))
+    hardware_risk = as_bool(classification.get("hardware_risk"))
+    hardware_risk_keywords = as_string_list(classification.get("hardware_risk_keywords"))
     review_passed = first_layer_passed(review)
 
     category = normalize_choice(classification.get("category"), allowed_categories, "out_of_scope")
@@ -544,9 +613,6 @@ def merge_triage_layers(
     review_result = {
         "provider": str(review.get("provider", "unknown")),
         "related": related,
-        "hardware_risk": hardware_risk,
-        "need_human": need_human,
-        "hardware_risk_keywords": hardware_risk_keywords,
         "reason": str(review.get("reason", "")).strip(),
         "confidence": as_float(review.get("confidence"), 0.0),
     }
@@ -554,6 +620,9 @@ def merge_triage_layers(
         "provider": str(classification.get("provider", "unknown")),
         "category": category,
         "difficulty": difficulty,
+        "hardware_risk": hardware_risk,
+        "need_human": need_human,
+        "hardware_risk_keywords": hardware_risk_keywords,
         "need_project_context": need_project_context,
         "missing_info": as_string_list(classification.get("missing_info")),
         "reason": str(classification.get("reason", "")).strip(),
@@ -581,14 +650,14 @@ def call_llm_review_layer(
     log_text: str,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """调用模型服务做第一层审查：相关性、硬件风险和是否转人工。"""
+    """调用便宜模型做第一层相关性审查。"""
     content = call_llm_chat(
         [
             {
                 "role": "system",
                 "content": (
                     "你是机器人售后问题的第一层审查器。只判断输入是否属于机器人售后范围，"
-                    "以及是否存在硬件安全风险或必须人工介入的情况。只输出 JSON。"
+                    "不要判断硬件风险、是否人工介入或处理路径。只输出 JSON。"
                 ),
             },
             {
@@ -598,17 +667,13 @@ def call_llm_review_layer(
                         "请审查下面的学生问题和日志，返回 JSON：",
                         "{",
                         '  "related": true/false,',
-                        '  "hardware_risk": true/false,',
-                        '  "need_human": true/false,',
-                        '  "hardware_risk_keywords": ["命中的风险词"],',
                         '  "reason": "一句话说明审查依据",',
                         '  "confidence": 0.0到1.0',
                         "}",
                         "",
                         "判定规则：",
                         "- related 只表示是否和机器人/ROS/传感器/底盘/功能包售后相关。",
-                        "- 出现冒烟、短路、烧坏、异味、明显过热、电源反接等，hardware_risk 和 need_human 必须为 true。",
-                        "- 不要做 FAQ 或 Debug 分类，那是下一层的任务。",
+                        "- 不要判断是否硬件风险、是否需要人工介入，也不要做 FAQ 或 Debug 分类。",
                         "",
                         "学生问题：",
                         question.strip() or "无",
@@ -627,9 +692,6 @@ def call_llm_review_layer(
     return {
         "provider": llm_provider_name(config),
         "related": as_bool(data.get("related")),
-        "hardware_risk": as_bool(data.get("hardware_risk")),
-        "need_human": as_bool(data.get("need_human")),
-        "hardware_risk_keywords": as_string_list(data.get("hardware_risk_keywords")),
         "reason": str(data.get("reason", "")).strip(),
         "confidence": as_float(data.get("confidence"), 0.0),
     }
@@ -648,7 +710,8 @@ def call_llm_classification_layer(
                 "role": "system",
                 "content": (
                     "你是机器人售后问题的第二层分类器。基于第一层审查结果，"
-                    "把问题分到固定处理路径。只输出 JSON，不要输出解释性正文。"
+                    "判断硬件风险、是否需要人工介入，并把问题分到固定处理路径。"
+                    "只输出 JSON，不要输出解释性正文。"
                 ),
             },
             {
@@ -659,6 +722,9 @@ def call_llm_classification_layer(
                         "{",
                         '  "category": "hardware_risk|project_debug|simple_faq|robot_general|out_of_scope",',
                         '  "difficulty": "human_review|complex|simple|medium|ignore_or_manual",',
+                        '  "hardware_risk": true/false,',
+                        '  "need_human": true/false,',
+                        '  "hardware_risk_keywords": ["命中的风险词"],',
                         '  "need_project_context": true/false,',
                         '  "missing_info": ["还需要补充的信息"],',
                         '  "reason": "一句话说明分类依据",',
@@ -671,6 +737,10 @@ def call_llm_classification_layer(
                         "- simple_faq：型号、参数、默认配置、账号、基础接线等简单 FAQ 可以处理。",
                         "- robot_general：机器人售后相关，但暂时不确定是否需要项目上下文。",
                         "- out_of_scope：和机器人售后无关。",
+                        "",
+                        "安全规则：",
+                        "- 出现冒烟、短路、烧坏、异味、明显过热、电源反接等，hardware_risk 和 need_human 必须为 true。",
+                        "- hardware_risk 或 need_human 为 true 时，category 必须是 hardware_risk，difficulty 必须是 human_review。",
                         "",
                         "注意：need_project_context 只是第二层的检索倾向，是否进入第四层模型由第三层检索结果最终决定。",
                         "",
@@ -695,6 +765,9 @@ def call_llm_classification_layer(
         "provider": llm_provider_name(config),
         "category": data.get("category", "out_of_scope"),
         "difficulty": data.get("difficulty", "ignore_or_manual"),
+        "hardware_risk": as_bool(data.get("hardware_risk")),
+        "need_human": as_bool(data.get("need_human")),
+        "hardware_risk_keywords": as_string_list(data.get("hardware_risk_keywords")),
         "need_project_context": as_bool(data.get("need_project_context")),
         "missing_info": as_string_list(data.get("missing_info")),
         "reason": str(data.get("reason", "")).strip(),
@@ -712,13 +785,12 @@ def classify_question(
     if triage_mode not in {"auto", "llm"}:
         raise SystemExit("不支持的审查分类模式；本地关键词分流已移除，请使用 auto 或 llm。")
 
-    config = llm_config or load_llm_config()
-    has_api_key = not is_placeholder_api_key(str(config.get("api_key", "")))
-    if not has_api_key:
-        ensure_llm_config(config, "运行两层审查分类")
+    configs = llm_config or load_llm_configs()
+    review_config = layer_llm_config(configs, "review")
+    classification_config = layer_llm_config(configs, "classification")
 
     try:
-        review = call_llm_review_layer(question, log_text, config)
+        review = call_llm_review_layer(question, log_text, review_config)
         if not first_layer_passed(review):
             return merge_triage_layers(
                 review,
@@ -729,7 +801,7 @@ def classify_question(
             question,
             log_text,
             review,
-            config,
+            classification_config,
         )
         return merge_triage_layers(review, classification, {})
     except (SystemExit, ValueError, json.JSONDecodeError) as exc:
@@ -955,14 +1027,14 @@ def make_debug_prompt(
             f"- 提供方：{review.get('provider', 'unknown')}",
             f"- 是否通过：{triage.get('review_passed')}",
             f"- 是否相关：{triage.get('related')}",
-            f"- 硬件风险：{bool(triage.get('hardware_risk'))}",
-            f"- 需要人工：{triage.get('need_human')}",
             f"- 理由：{review.get('reason', '') or '无'}",
             "",
             "第二层分类：",
             f"- 提供方：{classification.get('provider', 'unknown')}",
             f"- 类别：{triage.get('category')}",
             f"- 难度：{triage.get('difficulty')}",
+            f"- 硬件风险：{bool(triage.get('hardware_risk'))}",
+            f"- 需要人工：{triage.get('need_human')}",
             f"- 需要项目上下文：{triage.get('need_project_context')}",
             f"- 理由：{classification.get('reason', '') or '无'}",
             f"- 缺少信息：{missing}",
@@ -1050,14 +1122,14 @@ def make_report(
         f"- 提供方：{review.get('provider', 'unknown')}",
         f"- 是否通过：{triage.get('review_passed')}",
         f"- 是否相关：{triage.get('related')}",
-        f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
-        f"- 是否建议人工介入：{triage.get('need_human')}",
         f"- 理由：{review.get('reason', '') or '无'}",
         "",
         "## 第二层分类",
         f"- 提供方：{classification.get('provider', 'unknown')}",
         f"- 分类：{triage.get('category')}",
         f"- 难度：{triage.get('difficulty')}",
+        f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
+        f"- 是否建议人工介入：{triage.get('need_human')}",
         f"- 是否需要项目上下文：{triage.get('need_project_context')}",
         f"- 理由：{classification.get('reason', '') or '无'}",
         f"- 缺少信息：{missing}",
@@ -1123,7 +1195,8 @@ def suggest_action(
 
 def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None) -> str:
     """调用配置好的 OpenAI-compatible 接口，生成最终模型诊断文本。"""
-    config = llm_config or load_llm_config()
+    configs = llm_config or load_llm_configs()
+    config = layer_llm_config(configs, "debug")
     return call_llm_chat(
         [
             {
@@ -1198,7 +1271,7 @@ def command_ask(args: argparse.Namespace) -> None:
     if not isinstance(faqs, list):
         raise SystemExit("FAQ 文件必须是 JSON 数组。")
 
-    llm_config = load_llm_config(args.llm_config)
+    llm_config = load_llm_configs(args.llm_config)
     triage = classify_question(
         question,
         log_text,
@@ -1229,8 +1302,6 @@ def command_ask(args: argparse.Namespace) -> None:
             faq_hits,
             contexts,
         )
-        if llm_config is None:
-            llm_config = load_llm_config(args.llm_config)
         llm_answer = call_openai_compatible(prompt, llm_config)
 
     report = make_report(index_data, question, log_text, triage, faq_hits, contexts, llm_answer)
