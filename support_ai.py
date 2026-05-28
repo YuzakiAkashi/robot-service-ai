@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Internal after-sales assistant MVP.
+机器人内部售后 AI 助手 MVP。
 
-It indexes a robot project in read-only mode, triages student questions,
-matches simple FAQ answers, retrieves relevant project snippets, and generates
-a project debug prompt for a code-capable LLM.
+用于只读索引机器人项目、审查和分类学生问题、匹配 FAQ、检索项目片段，
+并生成可交给代码模型继续排查的项目 Debug 提示。
 """
 
 from __future__ import annotations
@@ -102,12 +101,14 @@ IMPORTANT_NAMES = {
 
 
 def _string_list(value: Any, name: str) -> list[str]:
+    """校验 TOML 配置值是否为非空字符串列表。"""
     if not isinstance(value, list):
         raise SystemExit(f"关键词配置 {name} 必须是字符串数组")
     return [str(item).strip() for item in value if str(item).strip()]
 
 
 def load_keywords_config(path: Path = KEYWORDS_CONFIG_PATH) -> dict[str, Any]:
+    """从 TOML 文件加载并校验本地关键词规则。"""
     if not path.exists():
         raise SystemExit(f"关键词配置文件不存在: {path}")
     try:
@@ -145,10 +146,12 @@ HARDWARE_RISK_KEYWORDS = KEYWORD_CONFIG["hardware_risk"]
 
 
 def now_iso() -> str:
+    """返回当前本地时间的 ISO 字符串，不包含微秒。"""
     return dt.datetime.now().replace(microsecond=0).isoformat()
 
 
 def read_text_safe(path: Path, max_bytes: int | None = None) -> str:
+    """用常见编码安全读取文本文件，读取失败时返回空字符串。"""
     try:
         data = path.read_bytes()
     except OSError:
@@ -164,6 +167,7 @@ def read_text_safe(path: Path, max_bytes: int | None = None) -> str:
 
 
 def stable_hash(path: Path, max_bytes: int = 1024 * 1024) -> str:
+    """计算文件前 max_bytes 字节的稳定 SHA-1 哈希。"""
     digest = hashlib.sha1()
     try:
         with path.open("rb") as fh:
@@ -180,12 +184,14 @@ def stable_hash(path: Path, max_bytes: int = 1024 * 1024) -> str:
 
 
 def is_text_file(path: Path) -> bool:
+    """判断文件是否应作为可读文本纳入索引。"""
     if path.name in {"Dockerfile", "Makefile"}:
         return True
     return path.suffix.lower() in TEXT_EXTENSIONS
 
 
 def file_kind(rel_path: str) -> str:
+    """根据相对路径粗略判断索引文件的项目类型。"""
     rel = rel_path.replace("\\", "/").lower()
     name = Path(rel).name
     suffix = Path(rel).suffix
@@ -211,6 +217,7 @@ def file_kind(rel_path: str) -> str:
 
 
 def file_priority(rel_path: str) -> int:
+    """计算文件在项目级检索中的优先级分数。"""
     rel = rel_path.replace("\\", "/").lower()
     name = Path(rel).name
     score = 0
@@ -228,11 +235,13 @@ def file_priority(rel_path: str) -> int:
 
 
 def should_skip_dir(path: Path) -> bool:
+    """判断相对目录路径是否包含需要忽略的目录名。"""
     parts = {part.lower() for part in path.parts}
     return bool(parts & IGNORED_DIRS)
 
 
 def build_index(project_root: Path, name: str | None, max_file_bytes: int) -> dict[str, Any]:
+    """扫描项目目录，生成只读的可检索文件索引。"""
     root = project_root.resolve()
     if not root.exists() or not root.is_dir():
         raise SystemExit(f"项目路径不存在或不是文件夹: {root}")
@@ -293,6 +302,7 @@ def build_index(project_root: Path, name: str | None, max_file_bytes: int) -> di
 
 
 def load_json(path: Path, default: Any) -> Any:
+    """读取 JSON 文件；文件不存在时返回默认值。"""
     if not path.exists():
         return default
     try:
@@ -302,11 +312,13 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def write_json(path: Path, data: Any) -> None:
+    """以 UTF-8 写入 JSON 文件，并按需创建父目录。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def is_placeholder_api_key(value: str) -> bool:
+    """判断 API Key 是否为空或仍是占位文本。"""
     stripped = value.strip()
     if not stripped:
         return True
@@ -315,6 +327,7 @@ def is_placeholder_api_key(value: str) -> bool:
 
 
 def load_llm_config(config_path: str | None = None) -> dict[str, Any]:
+    """从本地 JSON 配置和环境变量读取豆包 API 设置。"""
     path = Path(config_path or os.getenv("AFTERSALES_DOUBAO_CONFIG", DOUBAO_DEFAULT_CONFIG))
     file_config: dict[str, Any] = {}
     if path.exists():
@@ -348,6 +361,7 @@ def load_llm_config(config_path: str | None = None) -> dict[str, Any]:
 
 
 def ensure_llm_api_key(config: dict[str, Any], purpose: str) -> None:
+    """在未配置豆包 API Key 时终止执行，并给出清晰提示。"""
     if is_placeholder_api_key(str(config.get("api_key", ""))):
         raise SystemExit(
             f"缺少豆包 API Key，无法{purpose}。请在 {config.get('config_path')} 填写 api_key，"
@@ -362,6 +376,7 @@ def call_doubao_chat(
     temperature: float = 0.2,
     max_tokens: int | None = None,
 ) -> str:
+    """调用豆包 OpenAI-compatible Chat API，并返回模型文本内容。"""
     ensure_llm_api_key(config, "调用豆包")
     url = str(config.get("base_url", DOUBAO_DEFAULT_BASE_URL)).rstrip("/") + "/chat/completions"
     payload: dict[str, Any] = {
@@ -409,6 +424,7 @@ def call_doubao_chat(
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    """从模型回复中提取并解析 JSON 对象，兼容代码块格式。"""
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
@@ -421,10 +437,12 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def normalize(text: str) -> str:
+    """标准化文本，用于大小写不敏感的关键词匹配。"""
     return text.lower().replace("\\", "/")
 
 
 def extract_terms(text: str) -> set[str]:
+    """从问题、日志和关键词扩展中提取可检索词。"""
     lowered = normalize(text)
     terms = set(re.findall(r"[a-z0-9_./:-]{2,}", lowered))
     for cn, expansions in CHINESE_EXPANSIONS.items():
@@ -438,6 +456,7 @@ def extract_terms(text: str) -> set[str]:
 
 
 def as_bool(value: Any, default: bool = False) -> bool:
+    """将常见布尔值写法转换为 bool，无法识别时返回默认值。"""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -450,6 +469,7 @@ def as_bool(value: Any, default: bool = False) -> bool:
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
+    """将值转换为 0.0 到 1.0 范围内的置信度浮点数。"""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -458,6 +478,7 @@ def as_float(value: Any, default: float = 0.0) -> float:
 
 
 def as_string_list(value: Any) -> list[str]:
+    """将单值或列表值整理成非空字符串列表。"""
     if value is None:
         return []
     if isinstance(value, list):
@@ -468,11 +489,13 @@ def as_string_list(value: Any) -> list[str]:
 
 
 def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
+    """当值属于允许的枚举选项时返回该值，否则返回默认值。"""
     text = str(value or "").strip()
     return text if text in allowed else default
 
 
 def build_local_review(triage: dict[str, Any]) -> dict[str, Any]:
+    """把本地规则分类结果转换成第一层审查结构。"""
     hardware_risk = as_string_list(triage.get("hardware_risk"))
     return {
         "provider": "local_rules",
@@ -486,6 +509,7 @@ def build_local_review(triage: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_local_classification(triage: dict[str, Any]) -> dict[str, Any]:
+    """把本地规则分类结果转换成第二层分类结构。"""
     return {
         "provider": "local_rules",
         "category": triage.get("category", "out_of_scope"),
@@ -502,6 +526,7 @@ def merge_triage_layers(
     classification: dict[str, Any],
     scores: dict[str, int],
 ) -> dict[str, Any]:
+    """合并第一层审查和第二层分类，生成统一的分流结果。"""
     allowed_categories = {
         "hardware_risk",
         "project_debug",
@@ -565,6 +590,7 @@ def merge_triage_layers(
 
 
 def classify_question_local(question: str, log_text: str) -> dict[str, Any]:
+    """使用本地关键词规则分类学生问题，作为离线兜底方案。"""
     combined = f"{question}\n{log_text}"
     lowered = normalize(combined)
 
@@ -640,6 +666,7 @@ def call_doubao_review_layer(
     log_text: str,
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """调用豆包做第一层审查：相关性、硬件风险和是否转人工。"""
     content = call_doubao_chat(
         [
             {
@@ -700,6 +727,7 @@ def call_doubao_classification_layer(
     local_hint: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """在第一层审查后，调用豆包做第二层处理路径分类。"""
     content = call_doubao_chat(
         [
             {
@@ -775,6 +803,7 @@ def classify_question(
     llm_config: dict[str, Any] | None = None,
     triage_mode: str = "auto",
 ) -> dict[str, Any]:
+    """按配置运行分流流程，可使用豆包在线分类或本地规则分类。"""
     local_triage = classify_question_local(question, log_text)
     if triage_mode == "local":
         return local_triage
@@ -811,6 +840,7 @@ def match_faqs(
     limit: int = 3,
     min_score: int = 5,
 ) -> list[dict[str, Any]]:
+    """根据问题和日志给 FAQ 条目打分，返回最匹配的答案。"""
     combined = normalize(f"{question}\n{log_text}")
     q_terms = extract_terms(combined)
     hits: list[dict[str, Any]] = []
@@ -844,6 +874,7 @@ def match_faqs(
 
 
 def score_file_for_query(file_item: dict[str, Any], content: str, terms: set[str]) -> tuple[int, list[str]]:
+    """根据检索词给单个索引文件打分，并返回命中的词。"""
     rel = normalize(file_item["path"])
     content_l = normalize(content)
     score = int(file_item.get("priority", 0))
@@ -863,6 +894,7 @@ def score_file_for_query(file_item: dict[str, Any], content: str, terms: set[str
 
 
 def make_snippets(content: str, terms: set[str], max_snippets: int = 3, context_lines: int = 3) -> list[str]:
+    """围绕命中检索词的行生成带行号的短文本片段。"""
     lines = content.splitlines()
     lowered_lines = [normalize(line) for line in lines]
     lowered_terms = [normalize(term) for term in terms if len(term) >= 2]
@@ -900,6 +932,7 @@ def retrieve_project_context(
     log_text: str,
     top_k: int,
 ) -> list[dict[str, Any]]:
+    """为当前问题检索最相关的项目文件和代码片段。"""
     root = Path(index_data["project_root"])
     terms = extract_terms(f"{question}\n{log_text}")
     if not terms:
@@ -939,6 +972,7 @@ def make_debug_prompt(
     faq_hits: list[dict[str, Any]],
     contexts: list[dict[str, Any]],
 ) -> str:
+    """生成发送给项目 Debug 模型层的完整提示词。"""
     faq_section = "无 FAQ 命中。"
     if faq_hits:
         faq_lines = []
@@ -1035,6 +1069,7 @@ def make_report(
     contexts: list[dict[str, Any]],
     llm_answer: str | None = None,
 ) -> str:
+    """渲染一份供售后人员审核的完整 Markdown 诊断报告。"""
     project_name = index_data.get("project_name", "unknown")
     prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
 
@@ -1121,6 +1156,7 @@ def suggest_action(
     faq_hits: list[dict[str, Any]],
     contexts: list[dict[str, Any]],
 ) -> str:
+    """根据分流、FAQ 和项目检索结果生成简短处理建议。"""
     if triage.get("need_human"):
         risks = "、".join(triage.get("hardware_risk", [])) or "硬件风险"
         return f"建议立即转人工处理。原因：检测到 {risks}，先让学生断电，避免继续通电测试。"
@@ -1136,6 +1172,7 @@ def suggest_action(
 
 
 def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None) -> str:
+    """调用配置好的豆包接口，生成最终模型诊断文本。"""
     config = llm_config or load_llm_config()
     return call_doubao_chat(
         [
@@ -1151,12 +1188,14 @@ def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None
 
 
 def append_history(history_path: Path, payload: dict[str, Any]) -> None:
+    """向 JSONL 历史文件追加一条售后案例处理记录。"""
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def command_index(args: argparse.Namespace) -> None:
+    """CLI 的 index 子命令：建立并保存项目索引。"""
     index_data = build_index(Path(args.project), args.name, args.max_file_bytes)
     out_path = Path(args.out)
     write_json(out_path, index_data)
@@ -1167,6 +1206,7 @@ def command_index(args: argparse.Namespace) -> None:
 
 
 def command_inspect(args: argparse.Namespace) -> None:
+    """CLI 的 inspect 子命令：打印已保存索引的概况。"""
     index_data = load_json(Path(args.index), default=None)
     if not index_data:
         raise SystemExit(f"索引不存在: {args.index}")
@@ -1184,6 +1224,7 @@ def command_inspect(args: argparse.Namespace) -> None:
 
 
 def command_ask(args: argparse.Namespace) -> None:
+    """CLI 的 ask 子命令：分流问题并生成诊断报告。"""
     index_data = load_json(Path(args.index), default=None)
     if not index_data:
         raise SystemExit(f"索引不存在: {args.index}")
@@ -1270,6 +1311,7 @@ def command_ask(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器并注册子命令。"""
     parser = argparse.ArgumentParser(
         description="机器人内部售后 AI 助手 MVP",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1313,6 +1355,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析命令行参数，分发到对应命令，并返回退出码。"""
     parser = build_parser()
     args = parser.parse_args(argv)
     args.func(args)
