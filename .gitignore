@@ -4,3 +4,5 @@
 /reports
 /samples
 /__pycache__
+/doubao_config.local.json
+/.env.local

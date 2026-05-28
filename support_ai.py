@@ -4,7 +4,7 @@ Internal after-sales assistant MVP.
 
 It indexes a robot project in read-only mode, triages student questions,
 matches simple FAQ answers, retrieves relevant project snippets, and generates
-a third-layer debug prompt for a code-capable LLM.
+a project debug prompt for a code-capable LLM.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -23,6 +24,10 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+DOUBAO_DEFAULT_CONFIG = "doubao_config.local.json"
+DOUBAO_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DOUBAO_DEFAULT_MODEL = "doubao-seed-2-0-lite-260215"
+KEYWORDS_CONFIG_PATH = Path(__file__).with_name("config") / "keywords.toml"
 
 IGNORED_DIRS = {
     ".git",
@@ -95,110 +100,48 @@ IMPORTANT_NAMES = {
     "manifest.xml",
 }
 
-CHINESE_EXPANSIONS = {
-    "雷达": ["lidar", "laser", "scan", "/scan", "rplidar", "ydlidar", "hokuyo"],
-    "激光": ["lidar", "laser", "scan", "/scan"],
-    "摄像头": ["camera", "image", "usb_cam", "realsense", "opencv"],
-    "相机": ["camera", "image", "usb_cam", "realsense", "opencv"],
-    "串口": ["serial", "ttyusb", "ttyacm", "baudrate", "port"],
-    "端口": ["serial", "ttyusb", "ttyacm", "port"],
-    "波特率": ["baudrate", "baud", "serial"],
-    "底盘": ["base", "chassis", "cmd_vel", "odom", "motor", "driver"],
-    "电机": ["motor", "driver", "base", "cmd_vel"],
-    "里程计": ["odom", "odometry", "encoder"],
-    "编译": ["build", "catkin", "colcon", "cmake", "make", "cmakelists", "package.xml"],
-    "启动": ["launch", "roslaunch", "node", "rosrun"],
-    "节点": ["node", "rosnode", "launch"],
-    "话题": ["topic", "rostopic", "publisher", "subscriber"],
-    "没有数据": ["no data", "topic", "publish", "subscribe", "driver"],
-    "权限": ["permission", "denied", "dialout", "chmod", "udev"],
-    "连接": ["connect", "network", "wifi", "ip", "serial"],
-    "导航": ["navigation", "nav", "move_base", "map", "amcl"],
-    "建图": ["slam", "gmapping", "cartographer", "map"],
-    "模型": ["model", "type", "version"],
-    "型号": ["model", "type", "version"],
-    "遥控": ["remote", "joystick", "joy", "teleop"],
-}
 
-RELATED_KEYWORDS = [
-    "机器人",
-    "小车",
-    "ros",
-    "ros2",
-    "launch",
-    "topic",
-    "节点",
-    "雷达",
-    "摄像头",
-    "串口",
-    "底盘",
-    "电机",
-    "编译",
-    "报错",
-    "日志",
-    "urdf",
-    "tf",
-    "imu",
-    "里程计",
-    "导航",
-    "建图",
-    "gazebo",
-]
+def _string_list(value: Any, name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise SystemExit(f"关键词配置 {name} 必须是字符串数组")
+    return [str(item).strip() for item in value if str(item).strip()]
 
-SIMPLE_KEYWORDS = [
-    "型号",
-    "参数",
-    "默认",
-    "是多少",
-    "接口",
-    "位置",
-    "电池",
-    "电压",
-    "尺寸",
-    "重量",
-    "ip",
-    "wifi",
-    "账号",
-    "密码",
-    "波特率",
-]
 
-COMPLEX_KEYWORDS = [
-    "报错",
-    "error",
-    "exception",
-    "traceback",
-    "failed",
-    "undefined reference",
-    "permission denied",
-    "catkin",
-    "colcon",
-    "cmake",
-    "make",
-    "编译",
-    "启动失败",
-    "没有数据",
-    "打不开",
-    "连不上",
-    "topic",
-    "roslaunch",
-    "源码",
-    "代码",
-    "debug",
-    "崩溃",
-    "segmentation fault",
-]
+def load_keywords_config(path: Path = KEYWORDS_CONFIG_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise SystemExit(f"关键词配置文件不存在: {path}")
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"关键词 TOML 格式错误: {path} ({exc})") from exc
 
-HARDWARE_RISK_KEYWORDS = [
-    "冒烟",
-    "烧",
-    "烧坏",
-    "短路",
-    "发烫",
-    "过热",
-    "异味",
-    "电源反接",
-]
+    expansions = data.get("chinese_expansions", {})
+    if not isinstance(expansions, dict):
+        raise SystemExit("关键词配置 chinese_expansions 必须是表")
+
+    keywords = data.get("keywords", {})
+    if not isinstance(keywords, dict):
+        raise SystemExit("关键词配置 keywords 必须是表")
+
+    return {
+        "chinese_expansions": {
+            str(key): _string_list(value, f"chinese_expansions.{key}")
+            for key, value in expansions.items()
+        },
+        "related": _string_list(keywords.get("related", []), "keywords.related"),
+        "simple": _string_list(keywords.get("simple", []), "keywords.simple"),
+        "complex": _string_list(keywords.get("complex", []), "keywords.complex"),
+        "hardware_risk": _string_list(keywords.get("hardware_risk", []), "keywords.hardware_risk"),
+    }
+
+
+KEYWORD_CONFIG = load_keywords_config()
+CHINESE_EXPANSIONS = KEYWORD_CONFIG["chinese_expansions"]
+RELATED_KEYWORDS = KEYWORD_CONFIG["related"]
+SIMPLE_KEYWORDS = KEYWORD_CONFIG["simple"]
+COMPLEX_KEYWORDS = KEYWORD_CONFIG["complex"]
+HARDWARE_RISK_KEYWORDS = KEYWORD_CONFIG["hardware_risk"]
 
 
 def now_iso() -> str:
@@ -363,6 +306,120 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def is_placeholder_api_key(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return True
+    placeholders = {"YOUR_API_KEY_HERE", "your-api-key-here", "替换成你的 API Key"}
+    return stripped in placeholders or "替换" in stripped or "你的" in stripped
+
+
+def load_llm_config(config_path: str | None = None) -> dict[str, Any]:
+    path = Path(config_path or os.getenv("AFTERSALES_DOUBAO_CONFIG", DOUBAO_DEFAULT_CONFIG))
+    file_config: dict[str, Any] = {}
+    if path.exists():
+        loaded = load_json(path, default={})
+        if not isinstance(loaded, dict):
+            raise SystemExit(f"豆包配置文件必须是 JSON 对象: {path}")
+        file_config = loaded
+
+    api_key = (
+        os.getenv("ARK_API_KEY")
+        or os.getenv("AFTERSALES_DOUBAO_API_KEY")
+        or str(file_config.get("api_key", ""))
+    ).strip()
+    base_url = (
+        os.getenv("AFTERSALES_DOUBAO_BASE_URL")
+        or os.getenv("ARK_BASE_URL")
+        or str(file_config.get("base_url", DOUBAO_DEFAULT_BASE_URL))
+    ).strip()
+    model = (
+        os.getenv("AFTERSALES_DOUBAO_MODEL")
+        or os.getenv("ARK_MODEL")
+        or str(file_config.get("model", DOUBAO_DEFAULT_MODEL))
+    ).strip()
+
+    return {
+        "api_key": api_key,
+        "base_url": base_url or DOUBAO_DEFAULT_BASE_URL,
+        "model": model or DOUBAO_DEFAULT_MODEL,
+        "config_path": str(path),
+    }
+
+
+def ensure_llm_api_key(config: dict[str, Any], purpose: str) -> None:
+    if is_placeholder_api_key(str(config.get("api_key", ""))):
+        raise SystemExit(
+            f"缺少豆包 API Key，无法{purpose}。请在 {config.get('config_path')} 填写 api_key，"
+            "或设置环境变量 ARK_API_KEY。"
+        )
+
+
+def call_doubao_chat(
+    messages: list[dict[str, str]],
+    config: dict[str, Any],
+    *,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> str:
+    ensure_llm_api_key(config, "调用豆包")
+    url = str(config.get("base_url", DOUBAO_DEFAULT_BASE_URL)).rstrip("/") + "/chat/completions"
+    payload: dict[str, Any] = {
+        "model": config.get("model", DOUBAO_DEFAULT_MODEL),
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    request = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config['api_key']}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise SystemExit(f"调用豆包失败: HTTP {exc.code} {detail[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"调用豆包失败: {exc}") from exc
+
+    data = json.loads(body)
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise SystemExit(f"豆包返回格式异常: {body[:1000]}") from exc
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("response does not contain a JSON object")
+    return json.loads(stripped[start : end + 1])
+
+
 def normalize(text: str) -> str:
     return text.lower().replace("\\", "/")
 
@@ -380,7 +437,134 @@ def extract_terms(text: str) -> set[str]:
     return {term for term in terms if len(term) >= 2}
 
 
-def classify_question(question: str, log_text: str) -> dict[str, Any]:
+def as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "是"}:
+            return True
+        if lowered in {"false", "no", "0", "否"}:
+            return False
+    return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, number))
+
+
+def as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()]
+
+
+def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
+    text = str(value or "").strip()
+    return text if text in allowed else default
+
+
+def build_local_review(triage: dict[str, Any]) -> dict[str, Any]:
+    hardware_risk = as_string_list(triage.get("hardware_risk"))
+    return {
+        "provider": "local_rules",
+        "related": bool(triage.get("related")),
+        "hardware_risk": bool(hardware_risk),
+        "need_human": bool(triage.get("need_human")),
+        "hardware_risk_keywords": hardware_risk,
+        "reason": "基于本地关键词规则完成审查。",
+        "confidence": 0.65,
+    }
+
+
+def build_local_classification(triage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": "local_rules",
+        "category": triage.get("category", "out_of_scope"),
+        "difficulty": triage.get("difficulty", "ignore_or_manual"),
+        "need_project_context": bool(triage.get("need_project_context")),
+        "missing_info": as_string_list(triage.get("missing_info")),
+        "reason": "基于本地关键词规则完成分类。",
+        "confidence": 0.65,
+    }
+
+
+def merge_triage_layers(
+    review: dict[str, Any],
+    classification: dict[str, Any],
+    scores: dict[str, int],
+) -> dict[str, Any]:
+    allowed_categories = {
+        "hardware_risk",
+        "project_debug",
+        "simple_faq",
+        "robot_general",
+        "out_of_scope",
+    }
+    allowed_difficulties = {"human_review", "complex", "simple", "medium", "ignore_or_manual"}
+
+    related = as_bool(review.get("related"))
+    need_human = as_bool(review.get("need_human"))
+    hardware_risk = as_bool(review.get("hardware_risk"))
+    hardware_risk_keywords = as_string_list(review.get("hardware_risk_keywords"))
+
+    category = normalize_choice(classification.get("category"), allowed_categories, "out_of_scope")
+    difficulty = normalize_choice(classification.get("difficulty"), allowed_difficulties, "ignore_or_manual")
+    need_project_context = as_bool(classification.get("need_project_context"))
+
+    if need_human or hardware_risk:
+        category = "hardware_risk"
+        difficulty = "human_review"
+        need_human = True
+        need_project_context = False
+        related = True
+    elif not related:
+        category = "out_of_scope"
+        difficulty = "ignore_or_manual"
+        need_project_context = False
+
+    review_result = {
+        "provider": str(review.get("provider", "unknown")),
+        "related": related,
+        "hardware_risk": hardware_risk,
+        "need_human": need_human,
+        "hardware_risk_keywords": hardware_risk_keywords,
+        "reason": str(review.get("reason", "")).strip(),
+        "confidence": as_float(review.get("confidence"), 0.0),
+    }
+    classification_result = {
+        "provider": str(classification.get("provider", "unknown")),
+        "category": category,
+        "difficulty": difficulty,
+        "need_project_context": need_project_context,
+        "missing_info": as_string_list(classification.get("missing_info")),
+        "reason": str(classification.get("reason", "")).strip(),
+        "confidence": as_float(classification.get("confidence"), 0.0),
+    }
+
+    return {
+        "related": related,
+        "category": category,
+        "difficulty": difficulty,
+        "need_project_context": need_project_context,
+        "need_human": need_human,
+        "hardware_risk": hardware_risk_keywords,
+        "missing_info": classification_result["missing_info"],
+        "review": review_result,
+        "classification": classification_result,
+        "scores": scores,
+    }
+
+
+def classify_question_local(question: str, log_text: str) -> dict[str, Any]:
     combined = f"{question}\n{log_text}"
     lowered = normalize(combined)
 
@@ -430,7 +614,7 @@ def classify_question(question: str, log_text: str) -> dict[str, Any]:
         if any(word in combined for word in ["串口", "tty", "雷达", "底盘"]) and "lsusb" not in lowered:
             missing_info.append("设备识别信息，例如 lsusb、dmesg 或 /dev/ttyUSB*")
 
-    return {
+    triage = {
         "related": category != "out_of_scope",
         "category": category,
         "difficulty": difficulty,
@@ -444,6 +628,180 @@ def classify_question(question: str, log_text: str) -> dict[str, Any]:
             "complex": complex_score,
         },
     }
+    return merge_triage_layers(
+        build_local_review(triage),
+        build_local_classification(triage),
+        triage["scores"],
+    )
+
+
+def call_doubao_review_layer(
+    question: str,
+    log_text: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    content = call_doubao_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是机器人售后问题的第一层审查器。只判断输入是否属于机器人售后范围，"
+                    "以及是否存在硬件安全风险或必须人工介入的情况。只输出 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(
+                    [
+                        "请审查下面的学生问题和日志，返回 JSON：",
+                        "{",
+                        '  "related": true/false,',
+                        '  "hardware_risk": true/false,',
+                        '  "need_human": true/false,',
+                        '  "hardware_risk_keywords": ["命中的风险词"],',
+                        '  "reason": "一句话说明审查依据",',
+                        '  "confidence": 0.0到1.0',
+                        "}",
+                        "",
+                        "判定规则：",
+                        "- related 只表示是否和机器人/ROS/传感器/底盘/功能包售后相关。",
+                        "- 出现冒烟、短路、烧坏、异味、明显过热、电源反接等，hardware_risk 和 need_human 必须为 true。",
+                        "- 不要做 FAQ 或 Debug 分类，那是下一层的任务。",
+                        "",
+                        "学生问题：",
+                        question.strip() or "无",
+                        "",
+                        "学生日志：",
+                        log_text.strip() or "无",
+                    ]
+                ),
+            },
+        ],
+        config,
+        temperature=0.0,
+        max_tokens=500,
+    )
+    data = parse_json_object(content)
+    return {
+        "provider": "doubao",
+        "related": as_bool(data.get("related")),
+        "hardware_risk": as_bool(data.get("hardware_risk")),
+        "need_human": as_bool(data.get("need_human")),
+        "hardware_risk_keywords": as_string_list(data.get("hardware_risk_keywords")),
+        "reason": str(data.get("reason", "")).strip(),
+        "confidence": as_float(data.get("confidence"), 0.0),
+    }
+
+
+def call_doubao_classification_layer(
+    question: str,
+    log_text: str,
+    review: dict[str, Any],
+    local_hint: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    content = call_doubao_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是机器人售后问题的第二层分类器。基于第一层审查结果，"
+                    "把问题分到固定处理路径。只输出 JSON，不要输出解释性正文。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": "\n".join(
+                    [
+                        "请分类下面的学生问题和日志，返回 JSON：",
+                        "{",
+                        '  "category": "hardware_risk|project_debug|simple_faq|robot_general|out_of_scope",',
+                        '  "difficulty": "human_review|complex|simple|medium|ignore_or_manual",',
+                        '  "need_project_context": true/false,',
+                        '  "missing_info": ["还需要补充的信息"],',
+                        '  "reason": "一句话说明分类依据",',
+                        '  "confidence": 0.0到1.0',
+                        "}",
+                        "",
+                        "分类定义：",
+                        "- hardware_risk：有硬件安全风险，直接人工处理。",
+                        "- project_debug：需要结合项目文件、日志、launch/config/src 等做 Debug。",
+                        "- simple_faq：型号、参数、默认配置、账号、基础接线等简单 FAQ 可以处理。",
+                        "- robot_general：机器人售后相关，但暂时不确定是否需要项目上下文。",
+                        "- out_of_scope：和机器人售后无关。",
+                        "",
+                        "第一层审查结果：",
+                        json.dumps(review, ensure_ascii=False),
+                        "",
+                        "本地规则提示，仅供参考，若和输入矛盾请以输入为准：",
+                        json.dumps(
+                            {
+                                "category": local_hint.get("category"),
+                                "difficulty": local_hint.get("difficulty"),
+                                "scores": local_hint.get("scores"),
+                                "missing_info": local_hint.get("missing_info"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "",
+                        "学生问题：",
+                        question.strip() or "无",
+                        "",
+                        "学生日志：",
+                        log_text.strip() or "无",
+                    ]
+                ),
+            },
+        ],
+        config,
+        temperature=0.0,
+        max_tokens=700,
+    )
+    data = parse_json_object(content)
+    return {
+        "provider": "doubao",
+        "category": data.get("category", "out_of_scope"),
+        "difficulty": data.get("difficulty", "ignore_or_manual"),
+        "need_project_context": as_bool(data.get("need_project_context")),
+        "missing_info": as_string_list(data.get("missing_info")),
+        "reason": str(data.get("reason", "")).strip(),
+        "confidence": as_float(data.get("confidence"), 0.0),
+    }
+
+
+def classify_question(
+    question: str,
+    log_text: str,
+    llm_config: dict[str, Any] | None = None,
+    triage_mode: str = "auto",
+) -> dict[str, Any]:
+    local_triage = classify_question_local(question, log_text)
+    if triage_mode == "local":
+        return local_triage
+
+    config = llm_config or load_llm_config()
+    has_api_key = not is_placeholder_api_key(str(config.get("api_key", "")))
+    if not has_api_key:
+        if triage_mode == "doubao":
+            ensure_llm_api_key(config, "运行豆包两层审查分类")
+        local_triage["online_note"] = f"未找到豆包 API Key，已使用本地规则。配置文件: {config.get('config_path')}"
+        return local_triage
+
+    try:
+        review = call_doubao_review_layer(question, log_text, config)
+        classification = call_doubao_classification_layer(
+            question,
+            log_text,
+            review,
+            local_triage,
+            config,
+        )
+        return merge_triage_layers(review, classification, local_triage.get("scores", {}))
+    except (SystemExit, ValueError, json.JSONDecodeError) as exc:
+        if triage_mode == "doubao":
+            raise
+        local_triage["online_note"] = f"豆包审查分类失败，已使用本地规则: {exc}"
+        return local_triage
 
 
 def match_faqs(
@@ -604,6 +962,8 @@ def make_debug_prompt(
 
     log_section = log_text.strip() or "学生没有提供日志。"
     missing = "、".join(triage.get("missing_info", [])) or "无"
+    review = triage.get("review", {})
+    classification = triage.get("classification", {})
 
     return "\n".join(
         [
@@ -619,9 +979,18 @@ def make_debug_prompt(
             f"项目名称：{project_name}",
             "",
             "第一层审查：",
+            f"- 提供方：{review.get('provider', 'unknown')}",
+            f"- 是否相关：{triage.get('related')}",
+            f"- 硬件风险：{bool(triage.get('hardware_risk'))}",
+            f"- 需要人工：{triage.get('need_human')}",
+            f"- 理由：{review.get('reason', '') or '无'}",
+            "",
+            "第二层分类：",
+            f"- 提供方：{classification.get('provider', 'unknown')}",
             f"- 类别：{triage.get('category')}",
             f"- 难度：{triage.get('difficulty')}",
-            f"- 需要人工：{triage.get('need_human')}",
+            f"- 需要项目上下文：{triage.get('need_project_context')}",
+            f"- 理由：{classification.get('reason', '') or '无'}",
             f"- 缺少信息：{missing}",
             "",
             "学生问题：",
@@ -685,6 +1054,8 @@ def make_report(
 
     missing = "、".join(triage.get("missing_info", [])) or "无"
     action_summary = suggest_action(triage, faq_hits, contexts)
+    review = triage.get("review", {})
+    classification = triage.get("classification", {})
     lines = [
         "# 售后问题诊断报告",
         "",
@@ -695,27 +1066,36 @@ def make_report(
         question.strip(),
         "",
         "## 第一层审查",
+        f"- 提供方：{review.get('provider', 'unknown')}",
         f"- 是否相关：{triage.get('related')}",
+        f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
+        f"- 是否建议人工介入：{triage.get('need_human')}",
+        f"- 理由：{review.get('reason', '') or '无'}",
+        "",
+        "## 第二层分类",
+        f"- 提供方：{classification.get('provider', 'unknown')}",
         f"- 分类：{triage.get('category')}",
         f"- 难度：{triage.get('difficulty')}",
         f"- 是否需要项目上下文：{triage.get('need_project_context')}",
-        f"- 是否建议人工介入：{triage.get('need_human')}",
+        f"- 理由：{classification.get('reason', '') or '无'}",
         f"- 缺少信息：{missing}",
         "",
         "## 建议处理",
         action_summary,
         "",
-        "## 第二层 FAQ 命中",
+        "## 第三层 FAQ 命中",
         faq_summary,
         "",
-        "## 第三层项目检索",
+        "## 第四层项目检索",
         context_summary,
         "",
     ]
+    if triage.get("online_note"):
+        lines.extend(["## 在线分类备注", str(triage.get("online_note")), ""])
     if triage.get("need_project_context") or contexts:
         lines.extend(
             [
-                "## 给第三层模型的诊断提示",
+                "## 给第四层模型的诊断提示",
                 "````text",
                 prompt,
                 "````",
@@ -724,14 +1104,14 @@ def make_report(
     else:
         lines.extend(
             [
-                "## 第三层模型提示",
-                "本问题已由第一层和第二层处理，当前不需要进入项目 Debug。",
+                "## 第四层模型提示",
+                "本问题已由上游审查分类和 FAQ 处理，当前不需要进入项目 Debug。",
             ]
         )
     report = "\n".join(lines)
 
     if llm_answer:
-        report += "\n\n## 第三层模型回答\n" + llm_answer.strip()
+        report += "\n\n## 第四层模型回答\n" + llm_answer.strip()
 
     return report + "\n"
 
@@ -748,52 +1128,26 @@ def suggest_action(
         return "问题不像机器人售后范围。建议让售后人员人工确认，或引导学生提供机器人型号、使用场景和报错信息。"
     if triage.get("category") == "simple_faq" and faq_hits:
         answer = str(faq_hits[0].get("answer", "")).strip()
-        return f"可以直接走第二层 FAQ 回复，不需要进入项目 Debug。\n\n推荐回复：{answer}"
+        return f"可以直接走第三层 FAQ 回复，不需要进入项目 Debug。\n\n推荐回复：{answer}"
     if contexts:
         paths = "、".join(item["path"] for item in contexts[:3])
-        return f"建议进入第三层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给 DeepSeek/Codex 类模型即可。"
+        return f"建议进入第四层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给豆包/Codex 类模型即可。"
     return "需要售后人员补充更多信息后再判断，优先补充型号、完整日志和复现步骤。"
 
 
-def call_openai_compatible(prompt: str) -> str:
-    api_key = os.getenv("AFTERSALES_LLM_API_KEY")
-    base_url = os.getenv("AFTERSALES_LLM_BASE_URL", "https://api.deepseek.com")
-    model = os.getenv("AFTERSALES_LLM_MODEL", "deepseek-chat")
-    if not api_key:
-        raise SystemExit("缺少环境变量 AFTERSALES_LLM_API_KEY，未调用线上模型。")
-
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
+def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None) -> str:
+    config = llm_config or load_llm_config()
+    return call_doubao_chat(
+        [
             {
                 "role": "system",
                 "content": "你是谨慎的机器人售后技术助手，只输出有依据的排查建议。",
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.2,
-    }
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+        config,
+        temperature=0.2,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"调用模型失败: {exc}") from exc
-
-    data = json.loads(body)
-    try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise SystemExit(f"模型返回格式异常: {body[:1000]}") from exc
 
 
 def append_history(history_path: Path, payload: dict[str, Any]) -> None:
@@ -853,7 +1207,15 @@ def command_ask(args: argparse.Namespace) -> None:
     if not isinstance(faqs, list):
         raise SystemExit("FAQ 文件必须是 JSON 数组。")
 
-    triage = classify_question(question, log_text)
+    llm_config = None
+    if args.triage_mode != "local" or args.call_llm:
+        llm_config = load_llm_config(args.llm_config)
+    triage = classify_question(
+        question,
+        log_text,
+        llm_config=llm_config,
+        triage_mode=args.triage_mode,
+    )
     faq_hits = match_faqs(question, log_text, faqs)
 
     need_context = triage.get("need_project_context") or not faq_hits
@@ -876,7 +1238,9 @@ def command_ask(args: argparse.Namespace) -> None:
         contexts,
     )
     if args.call_llm:
-        llm_answer = call_openai_compatible(prompt)
+        if llm_config is None:
+            llm_config = load_llm_config(args.llm_config)
+        llm_answer = call_openai_compatible(prompt, llm_config)
 
     report = make_report(index_data, question, log_text, triage, faq_hits, contexts, llm_answer)
 
@@ -932,10 +1296,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--log-file", help="学生日志文件")
     ask_parser.add_argument("--log-text", help="直接传入日志文本")
     ask_parser.add_argument("--max-log-bytes", type=int, default=120_000, help="日志读取上限")
-    ask_parser.add_argument("--top-k", type=int, default=8, help="第三层检索文件数量")
+    ask_parser.add_argument("--top-k", type=int, default=8, help="第四层检索文件数量")
     ask_parser.add_argument("--out", help="输出 Markdown 报告路径")
     ask_parser.add_argument("--history", help="追加记录到 JSONL 历史文件")
-    ask_parser.add_argument("--call-llm", action="store_true", help="调用 OpenAI-compatible 模型接口")
+    ask_parser.add_argument("--llm-config", default=DOUBAO_DEFAULT_CONFIG, help="豆包本地配置 JSON 路径")
+    ask_parser.add_argument(
+        "--triage-mode",
+        choices=["auto", "doubao", "local"],
+        default="auto",
+        help="两层审查分类模式；auto 有豆包 Key 就调用豆包，否则走本地规则",
+    )
+    ask_parser.add_argument("--call-llm", action="store_true", help="调用豆包生成第四层诊断回答")
     ask_parser.set_defaults(func=command_ask)
 
     return parser

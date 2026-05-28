@@ -1,0 +1,104 @@
+[chinese_expansions]
+"雷达" = ["lidar", "laser", "scan", "/scan", "rplidar", "ydlidar", "hokuyo"]
+"激光" = ["lidar", "laser", "scan", "/scan"]
+"摄像头" = ["camera", "image", "usb_cam", "realsense", "opencv"]
+"相机" = ["camera", "image", "usb_cam", "realsense", "opencv"]
+"串口" = ["serial", "ttyusb", "ttyacm", "baudrate", "port"]
+"端口" = ["serial", "ttyusb", "ttyacm", "port"]
+"波特率" = ["baudrate", "baud", "serial"]
+"底盘" = ["base", "chassis", "cmd_vel", "odom", "motor", "driver"]
+"电机" = ["motor", "driver", "base", "cmd_vel"]
+"里程计" = ["odom", "odometry", "encoder"]
+"编译" = ["build", "catkin", "colcon", "cmake", "make", "cmakelists", "package.xml"]
+"启动" = ["launch", "roslaunch", "node", "rosrun"]
+"节点" = ["node", "rosnode", "launch"]
+"话题" = ["topic", "rostopic", "publisher", "subscriber"]
+"没有数据" = ["no data", "topic", "publish", "subscribe", "driver"]
+"权限" = ["permission", "denied", "dialout", "chmod", "udev"]
+"连接" = ["connect", "network", "wifi", "ip", "serial"]
+"导航" = ["navigation", "nav", "move_base", "map", "amcl"]
+"建图" = ["slam", "gmapping", "cartographer", "map"]
+"模型" = ["model", "type", "version"]
+"型号" = ["model", "type", "version"]
+"遥控" = ["remote", "joystick", "joy", "teleop"]
+
+[keywords]
+related = [
+  "机器人",
+  "小车",
+  "ros",
+  "ros2",
+  "launch",
+  "topic",
+  "节点",
+  "雷达",
+  "摄像头",
+  "串口",
+  "底盘",
+  "电机",
+  "编译",
+  "报错",
+  "日志",
+  "urdf",
+  "tf",
+  "imu",
+  "里程计",
+  "导航",
+  "建图",
+  "gazebo",
+]
+
+simple = [
+  "型号",
+  "参数",
+  "默认",
+  "是多少",
+  "接口",
+  "位置",
+  "电池",
+  "电压",
+  "尺寸",
+  "重量",
+  "ip",
+  "wifi",
+  "账号",
+  "密码",
+  "波特率",
+]
+
+complex = [
+  "报错",
+  "error",
+  "exception",
+  "traceback",
+  "failed",
+  "undefined reference",
+  "permission denied",
+  "catkin",
+  "colcon",
+  "cmake",
+  "make",
+  "编译",
+  "启动失败",
+  "没有数据",
+  "打不开",
+  "连不上",
+  "topic",
+  "roslaunch",
+  "源码",
+  "代码",
+  "debug",
+  "崩溃",
+  "segmentation fault",
+]
+
+hardware_risk = [
+  "冒烟",
+  "烧",
+  "烧坏",
+  "短路",
+  "发烫",
+  "过热",
+  "异味",
+  "电源反接",
+]
