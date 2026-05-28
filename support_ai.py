@@ -21,9 +21,9 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-DOUBAO_DEFAULT_CONFIG = "doubao_config.local.json"
-DOUBAO_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DOUBAO_DEFAULT_MODEL = "doubao-seed-2-0-pro-260215"
+LLM_DEFAULT_CONFIG = "ai_config.local.json"
+LLM_DEFAULT_BASE_URL = "https://example.com/api/v1"
+LLM_DEFAULT_MODEL = "your-model-name"
 
 IGNORED_DIRS = {
     ".git",
@@ -278,61 +278,88 @@ def is_placeholder_api_key(value: str) -> bool:
     return stripped in placeholders or "替换" in stripped or "你的" in stripped
 
 
+def is_placeholder_model(value: str) -> bool:
+    """判断模型名是否为空或仍是占位文本。"""
+    stripped = value.strip()
+    if not stripped:
+        return True
+    placeholders = {"YOUR_MODEL_NAME", "your-model-name", "替换成你的模型名"}
+    return stripped in placeholders or "替换" in stripped or "你的" in stripped
+
+
+def is_placeholder_base_url(value: str) -> bool:
+    """判断 API Base URL 是否为空或仍是占位文本。"""
+    stripped = value.strip()
+    if not stripped:
+        return True
+    return stripped in {"https://example.com/api/v1", "your-base-url"} or "example.com" in stripped
+
+
 def load_llm_config(config_path: str | None = None) -> dict[str, Any]:
-    """从本地 JSON 配置和环境变量读取豆包 API 设置。"""
-    path = Path(config_path or os.getenv("AFTERSALES_DOUBAO_CONFIG", DOUBAO_DEFAULT_CONFIG))
+    """从本地 JSON 配置和环境变量读取模型服务 API 设置。"""
+    path = Path(config_path or os.getenv("AFTERSALES_AI_CONFIG", LLM_DEFAULT_CONFIG))
     file_config: dict[str, Any] = {}
     if path.exists():
         loaded = load_json(path, default={})
         if not isinstance(loaded, dict):
-            raise SystemExit(f"豆包配置文件必须是 JSON 对象: {path}")
+            raise SystemExit(f"AI 配置文件必须是 JSON 对象: {path}")
         file_config = loaded
 
     api_key = (
-        os.getenv("ARK_API_KEY")
-        or os.getenv("AFTERSALES_DOUBAO_API_KEY")
+        os.getenv("AFTERSALES_AI_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
         or str(file_config.get("api_key", ""))
     ).strip()
     base_url = (
-        os.getenv("AFTERSALES_DOUBAO_BASE_URL")
-        or os.getenv("ARK_BASE_URL")
-        or str(file_config.get("base_url", DOUBAO_DEFAULT_BASE_URL))
+        os.getenv("AFTERSALES_AI_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or str(file_config.get("base_url", LLM_DEFAULT_BASE_URL))
     ).strip()
     model = (
-        os.getenv("AFTERSALES_DOUBAO_MODEL")
-        or os.getenv("ARK_MODEL")
-        or str(file_config.get("model", DOUBAO_DEFAULT_MODEL))
+        os.getenv("AFTERSALES_AI_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or str(file_config.get("model", LLM_DEFAULT_MODEL))
     ).strip()
 
     return {
         "api_key": api_key,
-        "base_url": base_url or DOUBAO_DEFAULT_BASE_URL,
-        "model": model or DOUBAO_DEFAULT_MODEL,
+        "base_url": base_url or LLM_DEFAULT_BASE_URL,
+        "model": model or LLM_DEFAULT_MODEL,
         "config_path": str(path),
     }
 
 
-def ensure_llm_api_key(config: dict[str, Any], purpose: str) -> None:
-    """在未配置豆包 API Key 时终止执行，并给出清晰提示。"""
+def ensure_llm_config(config: dict[str, Any], purpose: str) -> None:
+    """在未配置模型服务关键参数时终止执行，并给出清晰提示。"""
     if is_placeholder_api_key(str(config.get("api_key", ""))):
         raise SystemExit(
-            f"缺少豆包 API Key，无法{purpose}。请在 {config.get('config_path')} 填写 api_key，"
-            "或设置环境变量 ARK_API_KEY。"
+            f"缺少模型服务 API Key，无法{purpose}。请在 {config.get('config_path')} 填写 api_key，"
+            "或设置环境变量 AFTERSALES_AI_API_KEY / OPENAI_API_KEY。"
+        )
+    if is_placeholder_model(str(config.get("model", ""))):
+        raise SystemExit(
+            f"缺少模型名称，无法{purpose}。请在 {config.get('config_path')} 填写 model，"
+            "或设置环境变量 AFTERSALES_AI_MODEL / OPENAI_MODEL。"
+        )
+    if is_placeholder_base_url(str(config.get("base_url", ""))):
+        raise SystemExit(
+            f"缺少 API Base URL，无法{purpose}。请在 {config.get('config_path')} 填写 base_url，"
+            "或设置环境变量 AFTERSALES_AI_BASE_URL / OPENAI_BASE_URL。"
         )
 
 
-def call_doubao_chat(
+def call_llm_chat(
     messages: list[dict[str, str]],
     config: dict[str, Any],
     *,
     temperature: float = 0.2,
     max_tokens: int | None = None,
 ) -> str:
-    """调用豆包 OpenAI-compatible Chat API，并返回模型文本内容。"""
-    ensure_llm_api_key(config, "调用豆包")
-    url = str(config.get("base_url", DOUBAO_DEFAULT_BASE_URL)).rstrip("/") + "/chat/completions"
+    """调用 OpenAI-compatible Chat API，并返回模型文本内容。"""
+    ensure_llm_config(config, "调用模型服务")
+    url = str(config.get("base_url", LLM_DEFAULT_BASE_URL)).rstrip("/") + "/chat/completions"
     payload: dict[str, Any] = {
-        "model": config.get("model", DOUBAO_DEFAULT_MODEL),
+        "model": config.get("model", LLM_DEFAULT_MODEL),
         "messages": messages,
         "temperature": temperature,
     }
@@ -353,15 +380,15 @@ def call_doubao_chat(
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
-        raise SystemExit(f"调用豆包失败: HTTP {exc.code} {detail[:1000]}") from exc
+        raise SystemExit(f"调用模型服务失败: HTTP {exc.code} {detail[:1000]}") from exc
     except urllib.error.URLError as exc:
-        raise SystemExit(f"调用豆包失败: {exc}") from exc
+        raise SystemExit(f"调用模型服务失败: {exc}") from exc
 
     data = json.loads(body)
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise SystemExit(f"豆包返回格式异常: {body[:1000]}") from exc
+        raise SystemExit(f"模型服务返回格式异常: {body[:1000]}") from exc
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -543,13 +570,13 @@ def merge_triage_layers(
     }
 
 
-def call_doubao_review_layer(
+def call_llm_review_layer(
     question: str,
     log_text: str,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """调用豆包做第一层审查：相关性、硬件风险和是否转人工。"""
-    content = call_doubao_chat(
+    """调用模型服务做第一层审查：相关性、硬件风险和是否转人工。"""
+    content = call_llm_chat(
         [
             {
                 "role": "system",
@@ -592,7 +619,7 @@ def call_doubao_review_layer(
     )
     data = parse_json_object(content)
     return {
-        "provider": "doubao",
+        "provider": "llm",
         "related": as_bool(data.get("related")),
         "hardware_risk": as_bool(data.get("hardware_risk")),
         "need_human": as_bool(data.get("need_human")),
@@ -602,14 +629,14 @@ def call_doubao_review_layer(
     }
 
 
-def call_doubao_classification_layer(
+def call_llm_classification_layer(
     question: str,
     log_text: str,
     review: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """第一层通过后，调用豆包做第二层处理路径分类。"""
-    content = call_doubao_chat(
+    """第一层通过后，调用模型服务做第二层处理路径分类。"""
+    content = call_llm_chat(
         [
             {
                 "role": "system",
@@ -659,7 +686,7 @@ def call_doubao_classification_layer(
     )
     data = parse_json_object(content)
     return {
-        "provider": "doubao",
+        "provider": "llm",
         "category": data.get("category", "out_of_scope"),
         "difficulty": data.get("difficulty", "ignore_or_manual"),
         "need_project_context": as_bool(data.get("need_project_context")),
@@ -675,24 +702,24 @@ def classify_question(
     llm_config: dict[str, Any] | None = None,
     triage_mode: str = "auto",
 ) -> dict[str, Any]:
-    """按配置调用豆包运行第一层审查和第二层分类。"""
-    if triage_mode not in {"auto", "doubao"}:
-        raise SystemExit("不支持的审查分类模式；本地关键词分流已移除，请使用 auto 或 doubao。")
+    """按配置调用模型服务运行第一层审查和第二层分类。"""
+    if triage_mode not in {"auto", "llm"}:
+        raise SystemExit("不支持的审查分类模式；本地关键词分流已移除，请使用 auto 或 llm。")
 
     config = llm_config or load_llm_config()
     has_api_key = not is_placeholder_api_key(str(config.get("api_key", "")))
     if not has_api_key:
-        ensure_llm_api_key(config, "运行豆包两层审查分类")
+        ensure_llm_config(config, "运行两层审查分类")
 
     try:
-        review = call_doubao_review_layer(question, log_text, config)
+        review = call_llm_review_layer(question, log_text, config)
         if not first_layer_passed(review):
             return merge_triage_layers(
                 review,
                 build_skipped_classification(review),
                 {},
             )
-        classification = call_doubao_classification_layer(
+        classification = call_llm_classification_layer(
             question,
             log_text,
             review,
@@ -700,9 +727,9 @@ def classify_question(
         )
         return merge_triage_layers(review, classification, {})
     except (SystemExit, ValueError, json.JSONDecodeError) as exc:
-        if triage_mode == "doubao":
+        if triage_mode == "llm":
             raise
-        raise SystemExit(f"豆包审查分类失败: {exc}") from exc
+        raise SystemExit(f"模型服务审查分类失败: {exc}") from exc
 
 
 def match_faqs(
@@ -1084,14 +1111,14 @@ def suggest_action(
         should_enter_fourth_layer(triage, faq_hits, contexts),
     ) and contexts:
         paths = "、".join(item["path"] for item in contexts[:3])
-        return f"建议进入第四层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给豆包/Codex 类模型即可。"
+        return f"建议进入第四层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给 AI/Codex 类模型即可。"
     return "需要售后人员补充更多信息后再判断，优先补充型号、完整日志和复现步骤。"
 
 
 def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None) -> str:
-    """调用配置好的豆包接口，生成最终模型诊断文本。"""
+    """调用配置好的 OpenAI-compatible 接口，生成最终模型诊断文本。"""
     config = llm_config or load_llm_config()
-    return call_doubao_chat(
+    return call_llm_chat(
         [
             {
                 "role": "system",
@@ -1259,14 +1286,14 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--top-k", type=int, default=8, help="第四层检索文件数量")
     ask_parser.add_argument("--out", help="输出 Markdown 报告路径")
     ask_parser.add_argument("--history", help="追加记录到 JSONL 历史文件")
-    ask_parser.add_argument("--llm-config", default=DOUBAO_DEFAULT_CONFIG, help="豆包本地配置 JSON 路径")
+    ask_parser.add_argument("--llm-config", default=LLM_DEFAULT_CONFIG, help="AI 服务本地配置 JSON 路径")
     ask_parser.add_argument(
         "--triage-mode",
-        choices=["auto", "doubao"],
+        choices=["auto", "llm"],
         default="auto",
-        help="两层审查分类模式；本地关键词分流已移除，auto 和 doubao 都需要豆包 Key",
+        help="两层审查分类模式；本地关键词分流已移除，auto 和 llm 都需要模型服务 Key",
     )
-    ask_parser.add_argument("--call-llm", action="store_true", help="调用豆包生成第四层诊断回答")
+    ask_parser.add_argument("--call-llm", action="store_true", help="调用模型服务生成第四层诊断回答")
     ask_parser.set_defaults(func=command_ask)
 
     return parser

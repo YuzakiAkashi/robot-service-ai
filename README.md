@@ -7,9 +7,9 @@
 ```text
 学生问题 + 日志
   ↓
-第一层：豆包审查（相关性 / 硬件风险 / 是否转人工）
+第一层：AI 审查（相关性 / 硬件风险 / 是否转人工）
   ↓
-第二层：豆包分类（FAQ / 项目 Debug / 泛机器人问题 / 越界）
+第二层：AI 分类（FAQ / 项目 Debug / 泛机器人问题 / 越界）
   ↓
 第三层：FAQ / 项目片段检索
   ↓
@@ -41,14 +41,14 @@ topic 没有输出
 - 项目文件扫描和只读索引
 - 忽略 `build/`、`devel/`、`install/`、`.git/`、`logs/` 等无关目录
 - 识别 ROS 相关文件类型
-- 第一层豆包审查
-- 第二层豆包分类
+- 第一层 AI 审查
+- 第二层 AI 分类
 - 第三层 FAQ 匹配和项目相关文件检索
 - 第四层项目 Debug 模型提示与回答（按第三层检索结果进入）
 - 生成 Markdown 诊断报告
-- 生成可交给豆包、Codex 或其他代码模型的 Debug Prompt
+- 生成可交给 AI 服务、Codex 或其他代码模型的 Debug Prompt
 - 支持历史记录 JSONL
-- 支持火山方舟豆包 OpenAI-compatible API 调用
+- 支持 OpenAI-compatible API 调用
 
 重点索引文件包括：
 
@@ -147,37 +147,38 @@ python support_ai.py ask `
 命中相关 launch/config/src/README/package.xml/CMakeLists.txt 片段后进入第四层项目 Debug
 ```
 
-## 接入豆包 API
+## 接入 AI API
 
-默认从本地文件 `doubao_config.local.json` 读取火山方舟配置。这个文件已加入 `.gitignore`，不要提交到 GitHub。
+默认从本地文件 `ai_config.local.json` 读取 OpenAI-compatible API 配置。这个文件不要提交到 GitHub。
 
 ```json
 {
   "api_key": "替换成你的 API Key",
-  "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-  "model": "doubao-seed-2-0-lite-260215"
+  "base_url": "https://example.com/api/v1",
+  "model": "your-model-name"
 }
 ```
 
 也可以用环境变量覆盖：
 
 ```powershell
-$env:ARK_API_KEY="你的 API Key"
-$env:AFTERSALES_DOUBAO_MODEL="doubao-seed-2-0-lite-260215"
+$env:AFTERSALES_AI_API_KEY="你的 API Key"
+$env:AFTERSALES_AI_BASE_URL="https://example.com/api/v1"
+$env:AFTERSALES_AI_MODEL="your-model-name"
 ```
 
-`ask` 默认使用 `--triage-mode auto` 调用豆包完成第一层审查和第二层分类；本地关键词分流已移除，因此必须配置豆包 Key。显式使用豆包：
+`ask` 默认使用 `--triage-mode auto` 调用模型服务完成第一层审查和第二层分类；本地关键词分流已移除，因此必须配置模型服务 Key。显式使用模型服务：
 
 ```powershell
 python support_ai.py ask `
   --index indexes/mini_robot.json `
   --question-file samples/cases/lidar_permission_question.txt `
   --log-file samples/cases/lidar_permission_log.txt `
-  --triage-mode doubao `
-  --out reports/doubao_triage.md
+  --triage-mode llm `
+  --out reports/llm_triage.md
 ```
 
-需要豆包继续生成第四层诊断回答时，加上 `--call-llm`：
+需要模型服务继续生成第四层诊断回答时，加上 `--call-llm`：
 
 ```powershell
 python support_ai.py ask `
@@ -213,7 +214,7 @@ python support_ai.py ask `
 - FAQ 管理界面
 - 多功能包版本管理
 - 历史问答缓存
-- 豆包自动生成回复
+- AI 服务自动生成回复
 - 人工审核工作台
 
 更完整的产品需求见 [docs/product-requirements.md](docs/product-requirements.md)。
