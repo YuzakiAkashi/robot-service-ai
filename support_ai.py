@@ -25,7 +25,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 DOUBAO_DEFAULT_CONFIG = "doubao_config.local.json"
 DOUBAO_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DOUBAO_DEFAULT_MODEL = "doubao-seed-2-0-lite-260215"
+DOUBAO_DEFAULT_MODEL = "doubao-seed-2-0-pro-260215"
 KEYWORDS_CONFIG_PATH = Path(__file__).with_name("config") / "keywords.toml"
 
 IGNORED_DIRS = {
@@ -494,6 +494,16 @@ def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
     return text if text in allowed else default
 
 
+def first_layer_passed(review: dict[str, Any]) -> bool:
+    """判断第一层审查是否允许问题继续进入后续层级。"""
+    hardware_risk = as_bool(review.get("hardware_risk")) or bool(
+        as_string_list(review.get("hardware_risk_keywords"))
+    )
+    return as_bool(review.get("related")) and not hardware_risk and not as_bool(
+        review.get("need_human")
+    )
+
+
 def build_local_review(triage: dict[str, Any]) -> dict[str, Any]:
     """把本地规则分类结果转换成第一层审查结构。"""
     hardware_risk = as_string_list(triage.get("hardware_risk"))
@@ -521,6 +531,29 @@ def build_local_classification(triage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_skipped_classification(review: dict[str, Any]) -> dict[str, Any]:
+    """第一层未通过时生成第二层跳过结果，避免继续下探。"""
+    hardware_risk = as_bool(review.get("hardware_risk")) or bool(
+        as_string_list(review.get("hardware_risk_keywords"))
+    )
+    need_human = as_bool(review.get("need_human"))
+    if hardware_risk or need_human:
+        category = "hardware_risk"
+        difficulty = "human_review"
+    else:
+        category = "out_of_scope"
+        difficulty = "ignore_or_manual"
+    return {
+        "provider": "skipped",
+        "category": category,
+        "difficulty": difficulty,
+        "need_project_context": False,
+        "missing_info": [],
+        "reason": "第一层审查未通过，未进入第二层分类。",
+        "confidence": 0.0,
+    }
+
+
 def merge_triage_layers(
     review: dict[str, Any],
     classification: dict[str, Any],
@@ -540,6 +573,7 @@ def merge_triage_layers(
     need_human = as_bool(review.get("need_human"))
     hardware_risk = as_bool(review.get("hardware_risk"))
     hardware_risk_keywords = as_string_list(review.get("hardware_risk_keywords"))
+    review_passed = first_layer_passed(review)
 
     category = normalize_choice(classification.get("category"), allowed_categories, "out_of_scope")
     difficulty = normalize_choice(classification.get("difficulty"), allowed_difficulties, "ignore_or_manual")
@@ -585,6 +619,8 @@ def merge_triage_layers(
         "missing_info": classification_result["missing_info"],
         "review": review_result,
         "classification": classification_result,
+        "review_passed": review_passed,
+        "stop_after_review": not review_passed,
         "scores": scores,
     }
 
@@ -654,11 +690,13 @@ def classify_question_local(question: str, log_text: str) -> dict[str, Any]:
             "complex": complex_score,
         },
     }
-    return merge_triage_layers(
-        build_local_review(triage),
-        build_local_classification(triage),
-        triage["scores"],
+    review = build_local_review(triage)
+    classification = (
+        build_local_classification(triage)
+        if first_layer_passed(review)
+        else build_skipped_classification(review)
     )
+    return merge_triage_layers(review, classification, triage["scores"])
 
 
 def call_doubao_review_layer(
@@ -727,7 +765,7 @@ def call_doubao_classification_layer(
     local_hint: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """在第一层审查后，调用豆包做第二层处理路径分类。"""
+    """第一层通过后，调用豆包做第二层处理路径分类。"""
     content = call_doubao_chat(
         [
             {
@@ -757,6 +795,8 @@ def call_doubao_classification_layer(
                         "- simple_faq：型号、参数、默认配置、账号、基础接线等简单 FAQ 可以处理。",
                         "- robot_general：机器人售后相关，但暂时不确定是否需要项目上下文。",
                         "- out_of_scope：和机器人售后无关。",
+                        "",
+                        "注意：need_project_context 只是第二层的检索倾向，是否进入第四层模型由第三层检索结果最终决定。",
                         "",
                         "第一层审查结果：",
                         json.dumps(review, ensure_ascii=False),
@@ -818,6 +858,12 @@ def classify_question(
 
     try:
         review = call_doubao_review_layer(question, log_text, config)
+        if not first_layer_passed(review):
+            return merge_triage_layers(
+                review,
+                build_skipped_classification(review),
+                local_triage.get("scores", {}),
+            )
         classification = call_doubao_classification_layer(
             question,
             log_text,
@@ -964,6 +1010,40 @@ def retrieve_project_context(
     return candidates[:top_k]
 
 
+def should_retrieve_project_context(triage: dict[str, Any], faq_hits: list[dict[str, Any]]) -> bool:
+    """第二层只给检索倾向，第三层先检索后再决定是否进入第四层。"""
+    review = triage.get("review", {})
+    if not first_layer_passed(review):
+        return False
+    category = str(triage.get("category", "out_of_scope"))
+    if category in {"hardware_risk", "out_of_scope"}:
+        return False
+    if category == "simple_faq" and faq_hits:
+        return False
+    return (
+        category in {"project_debug", "robot_general"}
+        or as_bool(triage.get("need_project_context"))
+        or not faq_hits
+    )
+
+
+def should_enter_fourth_layer(
+    triage: dict[str, Any],
+    faq_hits: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> bool:
+    """第三层检索命中项目上下文后，才允许进入第四层模型。"""
+    review = triage.get("review", {})
+    if not first_layer_passed(review):
+        return False
+    category = str(triage.get("category", "out_of_scope"))
+    if category in {"hardware_risk", "out_of_scope"}:
+        return False
+    if category == "simple_faq" and faq_hits:
+        return False
+    return bool(contexts)
+
+
 def make_debug_prompt(
     project_name: str,
     question: str,
@@ -1014,6 +1094,7 @@ def make_debug_prompt(
             "",
             "第一层审查：",
             f"- 提供方：{review.get('provider', 'unknown')}",
+            f"- 是否通过：{triage.get('review_passed')}",
             f"- 是否相关：{triage.get('related')}",
             f"- 硬件风险：{bool(triage.get('hardware_risk'))}",
             f"- 需要人工：{triage.get('need_human')}",
@@ -1071,7 +1152,13 @@ def make_report(
 ) -> str:
     """渲染一份供售后人员审核的完整 Markdown 诊断报告。"""
     project_name = index_data.get("project_name", "unknown")
-    prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
+    enter_fourth_layer = as_bool(
+        triage.get("enter_fourth_layer"),
+        should_enter_fourth_layer(triage, faq_hits, contexts),
+    )
+    prompt = ""
+    if enter_fourth_layer:
+        prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
 
     faq_summary = "无"
     if faq_hits:
@@ -1102,6 +1189,7 @@ def make_report(
         "",
         "## 第一层审查",
         f"- 提供方：{review.get('provider', 'unknown')}",
+        f"- 是否通过：{triage.get('review_passed')}",
         f"- 是否相关：{triage.get('related')}",
         f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
         f"- 是否建议人工介入：{triage.get('need_human')}",
@@ -1121,13 +1209,13 @@ def make_report(
         "## 第三层 FAQ 命中",
         faq_summary,
         "",
-        "## 第四层项目检索",
+        "## 第三层项目检索",
         context_summary,
         "",
     ]
     if triage.get("online_note"):
         lines.extend(["## 在线分类备注", str(triage.get("online_note")), ""])
-    if triage.get("need_project_context") or contexts:
+    if enter_fourth_layer:
         lines.extend(
             [
                 "## 给第四层模型的诊断提示",
@@ -1140,7 +1228,7 @@ def make_report(
         lines.extend(
             [
                 "## 第四层模型提示",
-                "本问题已由上游审查分类和 FAQ 处理，当前不需要进入项目 Debug。",
+                "当前未进入第四层模型；第一层未通过、FAQ 已覆盖，或第三层没有检索到可用项目上下文。",
             ]
         )
     report = "\n".join(lines)
@@ -1165,7 +1253,10 @@ def suggest_action(
     if triage.get("category") == "simple_faq" and faq_hits:
         answer = str(faq_hits[0].get("answer", "")).strip()
         return f"可以直接走第三层 FAQ 回复，不需要进入项目 Debug。\n\n推荐回复：{answer}"
-    if contexts:
+    if as_bool(
+        triage.get("enter_fourth_layer"),
+        should_enter_fourth_layer(triage, faq_hits, contexts),
+    ) and contexts:
         paths = "、".join(item["path"] for item in contexts[:3])
         return f"建议进入第四层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给豆包/Codex 类模型即可。"
     return "需要售后人员补充更多信息后再判断，优先补充型号、完整日志和复现步骤。"
@@ -1257,28 +1348,30 @@ def command_ask(args: argparse.Namespace) -> None:
         llm_config=llm_config,
         triage_mode=args.triage_mode,
     )
-    faq_hits = match_faqs(question, log_text, faqs)
 
-    need_context = triage.get("need_project_context") or not faq_hits
+    faq_hits = []
     contexts = []
-    if need_context:
+    if first_layer_passed(triage.get("review", {})):
+        faq_hits = match_faqs(question, log_text, faqs)
+    if should_retrieve_project_context(triage, faq_hits):
         contexts = retrieve_project_context(
             index_data=index_data,
             question=question,
             log_text=log_text,
             top_k=args.top_k,
         )
+    triage["enter_fourth_layer"] = should_enter_fourth_layer(triage, faq_hits, contexts)
 
     llm_answer = None
-    prompt = make_debug_prompt(
-        index_data.get("project_name", "unknown"),
-        question,
-        log_text,
-        triage,
-        faq_hits,
-        contexts,
-    )
-    if args.call_llm:
+    if args.call_llm and triage["enter_fourth_layer"]:
+        prompt = make_debug_prompt(
+            index_data.get("project_name", "unknown"),
+            question,
+            log_text,
+            triage,
+            faq_hits,
+            contexts,
+        )
         if llm_config is None:
             llm_config = load_llm_config(args.llm_config)
         llm_answer = call_openai_compatible(prompt, llm_config)
@@ -1305,6 +1398,7 @@ def command_ask(args: argparse.Namespace) -> None:
                     for hit in faq_hits
                 ],
                 "context_paths": [item["path"] for item in contexts],
+                "enter_fourth_layer": triage.get("enter_fourth_layer"),
                 "report_path": args.out,
             },
         )

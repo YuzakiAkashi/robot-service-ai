@@ -11,9 +11,9 @@
   ↓
 第二层：豆包分类（FAQ / 项目 Debug / 泛机器人问题 / 越界）
   ↓
-第三层：简单问题 / FAQ
+第三层：FAQ / 项目片段检索
   ↓
-第四层：项目级 Debug
+第四层：项目级 Debug 模型（由第三层检索结果决定是否进入）
   ↓
 售后人员审核后回复学生
 ```
@@ -34,7 +34,7 @@ topic 没有输出
 摄像头/底盘/IMU 异常
 ```
 
-工具会先判断问题是否机器人售后相关，再决定走 FAQ 直接回复，还是进入项目级 Debug 检索。
+工具会先判断问题是否机器人售后相关；第一层审查不通过时停止下探。第二层分类后先进入第三层检索，再决定走 FAQ 直接回复，还是进入第四层项目级 Debug。
 
 ## 当前能力
 
@@ -43,8 +43,8 @@ topic 没有输出
 - 识别 ROS 相关文件类型
 - 第一层豆包审查
 - 第二层豆包分类
-- 第三层 FAQ 匹配
-- 第四层项目相关文件检索
+- 第三层 FAQ 匹配和项目相关文件检索
+- 第四层项目 Debug 模型提示与回答（按第三层检索结果进入）
 - 生成 Markdown 诊断报告
 - 生成可交给豆包、Codex 或其他代码模型的 Debug Prompt
 - 支持历史记录 JSONL
@@ -127,10 +127,9 @@ python support_ai.py ask `
 
 - 第一层审查结果
 - 第二层分类结果
-- FAQ 命中
-- 检索到的项目文件
+- 第三层 FAQ 命中和项目检索结果
 - 建议处理路径
-- 可复制给第四层模型的完整诊断提示
+- 需要进入第四层时，可复制给模型的完整诊断提示
 
 ## 示例结果
 
@@ -158,8 +157,8 @@ python support_ai.py ask `
 
 ```text
 分类：project_debug
-处理：进入第四层项目 Debug
-检索相关 launch/config/src/README/package.xml/CMakeLists.txt 片段
+处理：先做第三层项目检索
+命中相关 launch/config/src/README/package.xml/CMakeLists.txt 片段后进入第四层项目 Debug
 ```
 
 ## 接入豆包 API
