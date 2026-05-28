@@ -14,8 +14,6 @@ import hashlib
 import json
 import os
 import re
-import sys
-import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,7 +24,6 @@ SCHEMA_VERSION = 1
 DOUBAO_DEFAULT_CONFIG = "doubao_config.local.json"
 DOUBAO_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DOUBAO_DEFAULT_MODEL = "doubao-seed-2-0-pro-260215"
-KEYWORDS_CONFIG_PATH = Path(__file__).with_name("config") / "keywords.toml"
 
 IGNORED_DIRS = {
     ".git",
@@ -98,51 +95,6 @@ IMPORTANT_NAMES = {
     "requirements.txt",
     "manifest.xml",
 }
-
-
-def _string_list(value: Any, name: str) -> list[str]:
-    """校验 TOML 配置值是否为非空字符串列表。"""
-    if not isinstance(value, list):
-        raise SystemExit(f"关键词配置 {name} 必须是字符串数组")
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def load_keywords_config(path: Path = KEYWORDS_CONFIG_PATH) -> dict[str, Any]:
-    """从 TOML 文件加载并校验本地关键词规则。"""
-    if not path.exists():
-        raise SystemExit(f"关键词配置文件不存在: {path}")
-    try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        raise SystemExit(f"关键词 TOML 格式错误: {path} ({exc})") from exc
-
-    expansions = data.get("chinese_expansions", {})
-    if not isinstance(expansions, dict):
-        raise SystemExit("关键词配置 chinese_expansions 必须是表")
-
-    keywords = data.get("keywords", {})
-    if not isinstance(keywords, dict):
-        raise SystemExit("关键词配置 keywords 必须是表")
-
-    return {
-        "chinese_expansions": {
-            str(key): _string_list(value, f"chinese_expansions.{key}")
-            for key, value in expansions.items()
-        },
-        "related": _string_list(keywords.get("related", []), "keywords.related"),
-        "simple": _string_list(keywords.get("simple", []), "keywords.simple"),
-        "complex": _string_list(keywords.get("complex", []), "keywords.complex"),
-        "hardware_risk": _string_list(keywords.get("hardware_risk", []), "keywords.hardware_risk"),
-    }
-
-
-KEYWORD_CONFIG = load_keywords_config()
-CHINESE_EXPANSIONS = KEYWORD_CONFIG["chinese_expansions"]
-RELATED_KEYWORDS = KEYWORD_CONFIG["related"]
-SIMPLE_KEYWORDS = KEYWORD_CONFIG["simple"]
-COMPLEX_KEYWORDS = KEYWORD_CONFIG["complex"]
-HARDWARE_RISK_KEYWORDS = KEYWORD_CONFIG["hardware_risk"]
 
 
 def now_iso() -> str:
@@ -437,21 +389,14 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def normalize(text: str) -> str:
-    """标准化文本，用于大小写不敏感的关键词匹配。"""
+    """标准化文本，用于大小写不敏感的检索匹配。"""
     return text.lower().replace("\\", "/")
 
 
 def extract_terms(text: str) -> set[str]:
-    """从问题、日志和关键词扩展中提取可检索词。"""
+    """从问题和日志中提取基础可检索词。"""
     lowered = normalize(text)
     terms = set(re.findall(r"[a-z0-9_./:-]{2,}", lowered))
-    for cn, expansions in CHINESE_EXPANSIONS.items():
-        if cn in text:
-            terms.add(cn)
-            terms.update(expansions)
-    for keyword in RELATED_KEYWORDS + SIMPLE_KEYWORDS + COMPLEX_KEYWORDS:
-        if keyword in lowered or keyword in text:
-            terms.add(keyword.lower())
     return {term for term in terms if len(term) >= 2}
 
 
@@ -502,33 +447,6 @@ def first_layer_passed(review: dict[str, Any]) -> bool:
     return as_bool(review.get("related")) and not hardware_risk and not as_bool(
         review.get("need_human")
     )
-
-
-def build_local_review(triage: dict[str, Any]) -> dict[str, Any]:
-    """把本地规则分类结果转换成第一层审查结构。"""
-    hardware_risk = as_string_list(triage.get("hardware_risk"))
-    return {
-        "provider": "local_rules",
-        "related": bool(triage.get("related")),
-        "hardware_risk": bool(hardware_risk),
-        "need_human": bool(triage.get("need_human")),
-        "hardware_risk_keywords": hardware_risk,
-        "reason": "基于本地关键词规则完成审查。",
-        "confidence": 0.65,
-    }
-
-
-def build_local_classification(triage: dict[str, Any]) -> dict[str, Any]:
-    """把本地规则分类结果转换成第二层分类结构。"""
-    return {
-        "provider": "local_rules",
-        "category": triage.get("category", "out_of_scope"),
-        "difficulty": triage.get("difficulty", "ignore_or_manual"),
-        "need_project_context": bool(triage.get("need_project_context")),
-        "missing_info": as_string_list(triage.get("missing_info")),
-        "reason": "基于本地关键词规则完成分类。",
-        "confidence": 0.65,
-    }
 
 
 def build_skipped_classification(review: dict[str, Any]) -> dict[str, Any]:
@@ -625,80 +543,6 @@ def merge_triage_layers(
     }
 
 
-def classify_question_local(question: str, log_text: str) -> dict[str, Any]:
-    """使用本地关键词规则分类学生问题，作为离线兜底方案。"""
-    combined = f"{question}\n{log_text}"
-    lowered = normalize(combined)
-
-    related_score = 0
-    for keyword in RELATED_KEYWORDS:
-        if keyword.lower() in lowered or keyword in combined:
-            related_score += 1
-
-    simple_score = 0
-    for keyword in SIMPLE_KEYWORDS:
-        if keyword.lower() in lowered or keyword in combined:
-            simple_score += 1
-
-    complex_score = 0
-    for keyword in COMPLEX_KEYWORDS:
-        if keyword.lower() in lowered or keyword in combined:
-            complex_score += 1
-    if len(log_text.strip()) > 80:
-        complex_score += 2
-    if "traceback" in lowered or "[error]" in lowered or "error:" in lowered:
-        complex_score += 2
-
-    hardware_risk = [kw for kw in HARDWARE_RISK_KEYWORDS if kw in combined]
-
-    if hardware_risk:
-        category = "hardware_risk"
-        difficulty = "human_review"
-    elif complex_score >= 2:
-        category = "project_debug"
-        difficulty = "complex"
-    elif simple_score >= 1:
-        category = "simple_faq"
-        difficulty = "simple"
-    elif related_score >= 1:
-        category = "robot_general"
-        difficulty = "medium"
-    else:
-        category = "out_of_scope"
-        difficulty = "ignore_or_manual"
-
-    missing_info: list[str] = []
-    if category in {"project_debug", "robot_general"}:
-        if not any(word in combined for word in ["型号", "model", "版本", "package", "功能包"]):
-            missing_info.append("机器人型号或功能包版本")
-        if category == "project_debug" and not log_text.strip() and "报错" in combined:
-            missing_info.append("完整终端报错日志")
-        if any(word in combined for word in ["串口", "tty", "雷达", "底盘"]) and "lsusb" not in lowered:
-            missing_info.append("设备识别信息，例如 lsusb、dmesg 或 /dev/ttyUSB*")
-
-    triage = {
-        "related": category != "out_of_scope",
-        "category": category,
-        "difficulty": difficulty,
-        "need_project_context": category in {"project_debug", "robot_general"},
-        "need_human": category == "hardware_risk",
-        "hardware_risk": hardware_risk,
-        "missing_info": missing_info,
-        "scores": {
-            "related": related_score,
-            "simple": simple_score,
-            "complex": complex_score,
-        },
-    }
-    review = build_local_review(triage)
-    classification = (
-        build_local_classification(triage)
-        if first_layer_passed(review)
-        else build_skipped_classification(review)
-    )
-    return merge_triage_layers(review, classification, triage["scores"])
-
-
 def call_doubao_review_layer(
     question: str,
     log_text: str,
@@ -762,7 +606,6 @@ def call_doubao_classification_layer(
     question: str,
     log_text: str,
     review: dict[str, Any],
-    local_hint: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
     """第一层通过后，调用豆包做第二层处理路径分类。"""
@@ -801,17 +644,6 @@ def call_doubao_classification_layer(
                         "第一层审查结果：",
                         json.dumps(review, ensure_ascii=False),
                         "",
-                        "本地规则提示，仅供参考，若和输入矛盾请以输入为准：",
-                        json.dumps(
-                            {
-                                "category": local_hint.get("category"),
-                                "difficulty": local_hint.get("difficulty"),
-                                "scores": local_hint.get("scores"),
-                                "missing_info": local_hint.get("missing_info"),
-                            },
-                            ensure_ascii=False,
-                        ),
-                        "",
                         "学生问题：",
                         question.strip() or "无",
                         "",
@@ -843,18 +675,14 @@ def classify_question(
     llm_config: dict[str, Any] | None = None,
     triage_mode: str = "auto",
 ) -> dict[str, Any]:
-    """按配置运行分流流程，可使用豆包在线分类或本地规则分类。"""
-    local_triage = classify_question_local(question, log_text)
-    if triage_mode == "local":
-        return local_triage
+    """按配置调用豆包运行第一层审查和第二层分类。"""
+    if triage_mode not in {"auto", "doubao"}:
+        raise SystemExit("不支持的审查分类模式；本地关键词分流已移除，请使用 auto 或 doubao。")
 
     config = llm_config or load_llm_config()
     has_api_key = not is_placeholder_api_key(str(config.get("api_key", "")))
     if not has_api_key:
-        if triage_mode == "doubao":
-            ensure_llm_api_key(config, "运行豆包两层审查分类")
-        local_triage["online_note"] = f"未找到豆包 API Key，已使用本地规则。配置文件: {config.get('config_path')}"
-        return local_triage
+        ensure_llm_api_key(config, "运行豆包两层审查分类")
 
     try:
         review = call_doubao_review_layer(question, log_text, config)
@@ -862,21 +690,19 @@ def classify_question(
             return merge_triage_layers(
                 review,
                 build_skipped_classification(review),
-                local_triage.get("scores", {}),
+                {},
             )
         classification = call_doubao_classification_layer(
             question,
             log_text,
             review,
-            local_triage,
             config,
         )
-        return merge_triage_layers(review, classification, local_triage.get("scores", {}))
+        return merge_triage_layers(review, classification, {})
     except (SystemExit, ValueError, json.JSONDecodeError) as exc:
         if triage_mode == "doubao":
             raise
-        local_triage["online_note"] = f"豆包审查分类失败，已使用本地规则: {exc}"
-        return local_triage
+        raise SystemExit(f"豆包审查分类失败: {exc}") from exc
 
 
 def match_faqs(
@@ -1339,9 +1165,7 @@ def command_ask(args: argparse.Namespace) -> None:
     if not isinstance(faqs, list):
         raise SystemExit("FAQ 文件必须是 JSON 数组。")
 
-    llm_config = None
-    if args.triage_mode != "local" or args.call_llm:
-        llm_config = load_llm_config(args.llm_config)
+    llm_config = load_llm_config(args.llm_config)
     triage = classify_question(
         question,
         log_text,
@@ -1438,9 +1262,9 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--llm-config", default=DOUBAO_DEFAULT_CONFIG, help="豆包本地配置 JSON 路径")
     ask_parser.add_argument(
         "--triage-mode",
-        choices=["auto", "doubao", "local"],
+        choices=["auto", "doubao"],
         default="auto",
-        help="两层审查分类模式；auto 有豆包 Key 就调用豆包，否则走本地规则",
+        help="两层审查分类模式；本地关键词分流已移除，auto 和 doubao 都需要豆包 Key",
     )
     ask_parser.add_argument("--call-llm", action="store_true", help="调用豆包生成第四层诊断回答")
     ask_parser.set_defaults(func=command_ask)

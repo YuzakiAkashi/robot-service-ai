@@ -67,26 +67,12 @@ xacro
 log
 ```
 
-## 关键词配置
-
-本地规则兜底使用的关键词放在 `config/keywords.toml`，主程序启动时读取：
-
-- `[chinese_expansions]`：中文词到英文/ROS 关键词的扩展映射
-- `[keywords].related`：机器人售后相关性关键词
-- `[keywords].simple`：简单 FAQ 倾向关键词
-- `[keywords].complex`：项目 Debug 倾向关键词
-- `[keywords].hardware_risk`：硬件安全风险关键词
-
-这个文件是普通配置，可以提交到 GitHub；API Key 仍然只放在 `doubao_config.local.json`。
-
 ## 项目结构
 
 ```text
 robot-support-ai/
   README.md
   support_ai.py
-  config/
-    keywords.toml
   data/
     faqs.json
   indexes/
@@ -180,7 +166,7 @@ $env:ARK_API_KEY="你的 API Key"
 $env:AFTERSALES_DOUBAO_MODEL="doubao-seed-2-0-lite-260215"
 ```
 
-`ask` 默认使用 `--triage-mode auto`：检测到豆包 Key 就调用豆包完成第一层审查和第二层分类；没有 Key 时回退到本地规则。强制使用豆包：
+`ask` 默认使用 `--triage-mode auto` 调用豆包完成第一层审查和第二层分类；本地关键词分流已移除，因此必须配置豆包 Key。显式使用豆包：
 
 ```powershell
 python support_ai.py ask `
