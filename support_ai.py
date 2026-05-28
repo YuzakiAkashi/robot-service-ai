@@ -348,6 +348,12 @@ def ensure_llm_config(config: dict[str, Any], purpose: str) -> None:
         )
 
 
+def llm_provider_name(config: dict[str, Any]) -> str:
+    """返回报告中展示的模型名称。"""
+    model = str(config.get("model", "")).strip()
+    return model or "unknown"
+
+
 def call_llm_chat(
     messages: list[dict[str, str]],
     config: dict[str, Any],
@@ -619,7 +625,7 @@ def call_llm_review_layer(
     )
     data = parse_json_object(content)
     return {
-        "provider": "llm",
+        "provider": llm_provider_name(config),
         "related": as_bool(data.get("related")),
         "hardware_risk": as_bool(data.get("hardware_risk")),
         "need_human": as_bool(data.get("need_human")),
@@ -686,7 +692,7 @@ def call_llm_classification_layer(
     )
     data = parse_json_object(content)
     return {
-        "provider": "llm",
+        "provider": llm_provider_name(config),
         "category": data.get("category", "out_of_scope"),
         "difficulty": data.get("difficulty", "ignore_or_manual"),
         "need_project_context": as_bool(data.get("need_project_context")),
