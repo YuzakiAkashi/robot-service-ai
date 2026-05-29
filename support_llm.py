@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -424,23 +425,49 @@ def call_codex_cli(
             str(output_path),
             "-",
         ]
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            input=prompt,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            capture_output=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout_seconds,
             cwd=str(cwd),
-            check=False,
         )
+
+        captured_output: list[str] = []
+
+        def stream_process_output() -> None:
+            if process.stdout is None:
+                return
+            while True:
+                chunk = process.stdout.read(1)
+                if not chunk:
+                    break
+                captured_output.append(chunk)
+                print(chunk, end="", flush=True)
+
+        output_thread = threading.Thread(target=stream_process_output, daemon=True)
+        output_thread.start()
+        try:
+            if process.stdin is not None:
+                process.stdin.write(prompt)
+                process.stdin.close()
+        except OSError:
+            pass
+        returncode = process.wait(timeout=timeout_seconds)
+        output_thread.join(timeout=5)
     except FileNotFoundError as exc:
         cleanup_output()
         raise SystemExit(
             f"找不到 Codex CLI: {resolved_bin}。请设置 {CODEX_BIN_ENV_NAME} 或传入 --codex-bin。"
         ) from exc
     except subprocess.TimeoutExpired as exc:
+        try:
+            process.kill()
+        except OSError:
+            pass
         cleanup_output()
         raise SystemExit(
             f"调用 Codex CLI 超时（{timeout_seconds} 秒），可增大 --codex-timeout。"
@@ -449,10 +476,9 @@ def call_codex_cli(
         cleanup_output()
         raise SystemExit(f"调用 Codex CLI 失败: {exc}") from exc
 
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    if completed.returncode != 0:
-        detail = stderr or stdout or f"exit code {completed.returncode}"
+    stdout = "".join(captured_output).strip()
+    if returncode != 0:
+        detail = stdout or f"exit code {returncode}"
         cleanup_output()
         raise SystemExit(f"调用 Codex CLI 失败: {detail[:2000]}")
 
