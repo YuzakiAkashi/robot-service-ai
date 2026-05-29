@@ -86,6 +86,18 @@ robot-support-ai/
 
 ## 快速试跑
 
+启动最简前端：
+
+```powershell
+python web_app.py
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8000
+```
+
 建立示例功能包索引：
 
 ```powershell

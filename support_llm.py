@@ -425,6 +425,7 @@ def call_codex_cli(
             str(output_path),
             "-",
         ]
+        print("## Codex CLI 实时输出", flush=True)
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -458,6 +459,7 @@ def call_codex_cli(
             pass
         returncode = process.wait(timeout=timeout_seconds)
         output_thread.join(timeout=5)
+        print("\n## Codex CLI 输出结束", flush=True)
     except FileNotFoundError as exc:
         cleanup_output()
         raise SystemExit(
