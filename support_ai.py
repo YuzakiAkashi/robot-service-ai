@@ -854,99 +854,11 @@ def match_faqs(
     return hits[:limit]
 
 
-def score_file_for_query(file_item: dict[str, Any], content: str, terms: set[str]) -> tuple[int, list[str]]:
-    """根据检索词给单个索引文件打分，并返回命中的词。"""
-    rel = normalize(file_item["path"])
-    content_l = normalize(content)
-    score = int(file_item.get("priority", 0))
-    matched: list[str] = []
-
-    for term in terms:
-        term_l = normalize(term)
-        if term_l in rel:
-            score += 20
-            matched.append(term)
-        count = content_l.count(term_l)
-        if count:
-            score += min(count, 10) * 3
-            matched.append(term)
-
-    return score, sorted(set(matched))
-
-
-def make_snippets(content: str, terms: set[str], max_snippets: int = 3, context_lines: int = 3) -> list[str]:
-    """围绕命中检索词的行生成带行号的短文本片段。"""
-    lines = content.splitlines()
-    lowered_lines = [normalize(line) for line in lines]
-    lowered_terms = [normalize(term) for term in terms if len(term) >= 2]
-    anchors: list[int] = []
-
-    for index, line in enumerate(lowered_lines):
-        if any(term in line for term in lowered_terms):
-            anchors.append(index)
-            if len(anchors) >= max_snippets:
-                break
-
-    if not anchors and lines:
-        anchors = [0]
-
-    snippets: list[str] = []
-    used_ranges: list[range] = []
-    for anchor in anchors:
-        start = max(0, anchor - context_lines)
-        end = min(len(lines), anchor + context_lines + 1)
-        current_range = range(start, end)
-        if any(set(current_range) & set(existing) for existing in used_ranges):
-            continue
-        used_ranges.append(current_range)
-        numbered = [f"{line_no + 1}: {lines[line_no]}" for line_no in range(start, end)]
-        snippet = "\n".join(numbered)
-        if len(snippet) > 4000:
-            snippet = snippet[:4000] + "\n...<truncated>"
-        snippets.append(snippet)
-    return snippets
-
-
-def retrieve_project_context(
-    index_data: dict[str, Any],
-    question: str,
-    log_text: str,
-    top_k: int,
-) -> list[dict[str, Any]]:
-    """为当前问题检索最相关的项目文件和代码片段。"""
-    root = Path(index_data["project_root"])
-    terms = extract_terms(f"{question}\n{log_text}")
-    if not terms:
-        terms = {"launch", "config", "readme", "package.xml", "cmakelists"}
-
-    candidates: list[dict[str, Any]] = []
-    max_bytes = int(index_data.get("index_options", {}).get("max_file_bytes", 200_000))
-
-    for file_item in index_data.get("files", []):
-        path = root / file_item["path"]
-        if not path.exists():
-            continue
-        content = read_text_safe(path, max_bytes=max_bytes)
-        score, matched = score_file_for_query(file_item, content, terms)
-        if score <= 0:
-            continue
-        if matched or file_item.get("priority", 0) >= 25:
-            candidates.append(
-                {
-                    "path": file_item["path"],
-                    "kind": file_item.get("kind", "text"),
-                    "score": score,
-                    "matched_terms": matched[:16],
-                    "snippets": make_snippets(content, terms),
-                }
-            )
-
-    candidates.sort(key=lambda item: (-item["score"], item["path"]))
-    return candidates[:top_k]
-
-
-def should_retrieve_project_context(triage: dict[str, Any], faq_hits: list[dict[str, Any]]) -> bool:
-    """第二层只给检索倾向，第三层先检索后再决定是否进入第四层。"""
+def should_enter_fourth_layer(
+    triage: dict[str, Any],
+    faq_hits: list[dict[str, Any]],
+) -> bool:
+    """根据分流结果决定是否进入第四层模型。"""
     review = triage.get("review", {})
     if not first_layer_passed(review):
         return False
@@ -962,31 +874,14 @@ def should_retrieve_project_context(triage: dict[str, Any], faq_hits: list[dict[
     )
 
 
-def should_enter_fourth_layer(
-    triage: dict[str, Any],
-    faq_hits: list[dict[str, Any]],
-    contexts: list[dict[str, Any]],
-) -> bool:
-    """第三层检索命中项目上下文后，才允许进入第四层模型。"""
-    review = triage.get("review", {})
-    if not first_layer_passed(review):
-        return False
-    category = str(triage.get("category", "out_of_scope"))
-    if category in {"hardware_risk", "out_of_scope"}:
-        return False
-    if category == "simple_faq" and faq_hits:
-        return False
-    return bool(contexts)
-
-
 def make_debug_prompt(
     project_name: str,
     question: str,
     log_text: str,
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
-    contexts: list[dict[str, Any]],
     debug_rule_1: str | None = None,
+    project_context_note: str | None = None,
 ) -> str:
     """生成发送给项目 Debug 模型层的完整提示词。"""
     faq_section = "无 FAQ 命中。"
@@ -997,18 +892,6 @@ def make_debug_prompt(
                 f"- {hit.get('title') or hit.get('id')}: {hit.get('answer', '')}"
             )
         faq_section = "\n".join(faq_lines)
-
-    context_blocks = []
-    for item in contexts:
-        snippet_text = "\n\n".join(item.get("snippets", []))
-        context_blocks.append(
-            f"### {item['path']} ({item['kind']}, score={item['score']})\n"
-            f"Matched terms: {', '.join(item.get('matched_terms', [])) or 'none'}\n"
-            "```text\n"
-            f"{snippet_text}\n"
-            "```"
-        )
-    context_section = "\n\n".join(context_blocks) or "没有检索到相关项目片段。"
 
     log_section = log_text.strip() or "学生没有提供日志。"
     missing = "、".join(triage.get("missing_info", [])) or "无"
@@ -1035,7 +918,8 @@ def make_debug_prompt(
             "question": question.strip(),
             "log_text": log_section,
             "faq_section": faq_section,
-            "context_section": context_section,
+            "project_context_note": project_context_note
+            or "当前流程不再预检索项目代码片段；如果没有项目文件依据，请明确说明需要补充日志、文件名或代码上下文。",
         },
     )
 
@@ -1046,7 +930,6 @@ def make_codex_debug_prompt(
     log_text: str,
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
-    contexts: list[dict[str, Any]],
 ) -> str:
     """生成给本地 Codex CLI 的提示词，允许它在只读沙盒中自行检索项目文件。"""
     base_prompt = make_debug_prompt(
@@ -1055,8 +938,8 @@ def make_codex_debug_prompt(
         log_text,
         triage,
         faq_hits,
-        contexts,
         debug_rule_1=prompt_template("debug_rule_codex"),
+        project_context_note="当前流程不再预检索项目代码片段；你需要在只读项目目录中自行搜索相关文件。",
     )
     return f"{prompt_template('codex_debug_prefix')}\n\n{base_prompt}"
 
@@ -1067,18 +950,17 @@ def make_report(
     log_text: str,
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
-    contexts: list[dict[str, Any]],
     llm_answer: str | None = None,
 ) -> str:
     """渲染一份供售后人员审核的完整 Markdown 诊断报告。"""
     project_name = index_data.get("project_name", "unknown")
     enter_fourth_layer = as_bool(
         triage.get("enter_fourth_layer"),
-        should_enter_fourth_layer(triage, faq_hits, contexts),
+        should_enter_fourth_layer(triage, faq_hits),
     )
     prompt = ""
     if enter_fourth_layer:
-        prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
+        prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits)
 
     faq_summary = "无"
     if faq_hits:
@@ -1087,15 +969,8 @@ def make_report(
             lines.append(f"- {hit.get('title') or hit.get('id')} (score={hit.get('score')})")
         faq_summary = "\n".join(lines)
 
-    context_summary = "无"
-    if contexts:
-        context_summary = "\n".join(
-            f"- `{item['path']}` ({item['kind']}, score={item['score']})"
-            for item in contexts
-        )
-
     missing = "、".join(triage.get("missing_info", [])) or "无"
-    action_summary = suggest_action(triage, faq_hits, contexts)
+    action_summary = suggest_action(triage, faq_hits)
     review = triage.get("review", {})
     classification = triage.get("classification", {})
     lines = [
@@ -1129,9 +1004,6 @@ def make_report(
         "## 第三层 FAQ 命中",
         faq_summary,
         "",
-        "## 第三层项目检索",
-        context_summary,
-        "",
     ]
     if triage.get("online_note"):
         lines.extend(["## 在线分类备注", str(triage.get("online_note")), ""])
@@ -1162,9 +1034,8 @@ def make_report(
 def suggest_action(
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
-    contexts: list[dict[str, Any]],
 ) -> str:
-    """根据分流、FAQ 和项目检索结果生成简短处理建议。"""
+    """根据分流和 FAQ 结果生成简短处理建议。"""
     if triage.get("need_human"):
         risks = "、".join(triage.get("hardware_risk", [])) or "硬件风险"
         return f"建议立即转人工处理。原因：检测到 {risks}，先让学生断电，避免继续通电测试。"
@@ -1175,10 +1046,9 @@ def suggest_action(
         return f"可以直接走第三层 FAQ 回复，不需要进入项目 Debug。\n\n推荐回复：{answer}"
     if as_bool(
         triage.get("enter_fourth_layer"),
-        should_enter_fourth_layer(triage, faq_hits, contexts),
-    ) and contexts:
-        paths = "、".join(item["path"] for item in contexts[:3])
-        return f"建议进入第四层项目 Debug。已检索到相关文件：{paths}。把下方诊断提示交给 AI/Codex 类模型即可。"
+        should_enter_fourth_layer(triage, faq_hits),
+    ):
+        return "建议进入第四层项目 Debug。当前流程不再预检索代码片段；使用 Codex CLI 时会让 Codex 在只读项目目录中自行检索。"
     return "需要售后人员补充更多信息后再判断，优先补充型号、完整日志和复现步骤。"
 
 
@@ -1353,17 +1223,9 @@ def command_ask(args: argparse.Namespace) -> None:
     )
 
     faq_hits = []
-    contexts = []
     if first_layer_passed(triage.get("review", {})):
         faq_hits = match_faqs(question, log_text, faqs)
-    if should_retrieve_project_context(triage, faq_hits):
-        contexts = retrieve_project_context(
-            index_data=index_data,
-            question=question,
-            log_text=log_text,
-            top_k=args.top_k,
-        )
-    triage["enter_fourth_layer"] = should_enter_fourth_layer(triage, faq_hits, contexts)
+    triage["enter_fourth_layer"] = should_enter_fourth_layer(triage, faq_hits)
 
     llm_answer = None
     if (args.call_llm or args.call_codex) and triage["enter_fourth_layer"]:
@@ -1374,7 +1236,6 @@ def command_ask(args: argparse.Namespace) -> None:
             log_text,
             triage,
             faq_hits,
-            contexts,
         )
         if args.call_llm:
             llm_answer = call_openai_compatible(prompt, llm_config)
@@ -1386,7 +1247,7 @@ def command_ask(args: argparse.Namespace) -> None:
                 timeout_seconds=args.codex_timeout,
             )
 
-    report = make_report(index_data, question, log_text, triage, faq_hits, contexts, llm_answer)
+    report = make_report(index_data, question, log_text, triage, faq_hits, llm_answer)
 
     if args.out:
         out_path = Path(args.out)
@@ -1407,7 +1268,6 @@ def command_ask(args: argparse.Namespace) -> None:
                     {"id": hit.get("id"), "title": hit.get("title"), "score": hit.get("score")}
                     for hit in faq_hits
                 ],
-                "context_paths": [item["path"] for item in contexts],
                 "enter_fourth_layer": triage.get("enter_fourth_layer"),
                 "report_path": args.out,
             },
@@ -1442,7 +1302,6 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--log-file", help="学生日志文件")
     ask_parser.add_argument("--log-text", help="直接传入日志文本")
     ask_parser.add_argument("--max-log-bytes", type=int, default=120_000, help="日志读取上限")
-    ask_parser.add_argument("--top-k", type=int, default=8, help="第四层检索文件数量")
     ask_parser.add_argument("--out", help="输出 Markdown 报告路径")
     ask_parser.add_argument("--history", help="追加记录到 JSONL 历史文件")
     ask_parser.add_argument("--llm-config", default=LLM_DEFAULT_CONFIG, help="AI 服务本地配置 JSON 路径")
