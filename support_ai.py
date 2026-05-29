@@ -30,6 +30,7 @@ CODEX_BIN_ENV_NAME = "CODEX_BIN"
 CODEX_DEFAULT_BIN = "codex"
 CODEX_SANDBOX_MODE = "read-only"
 CODEX_DEFAULT_TIMEOUT_SECONDS = 600
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompts" / "ai_prompts.md"
 LLM_API_KEY_ENV_NAMES = ("AFTERSALES_AI_API_KEY", "OPENAI_API_KEY")
 LLM_BASE_URL_ENV_NAMES = ("AFTERSALES_AI_BASE_URL", "OPENAI_BASE_URL")
 LLM_MODEL_ENV_NAMES = ("AFTERSALES_AI_MODEL", "OPENAI_MODEL")
@@ -142,6 +143,53 @@ def read_text_safe(path: Path, max_bytes: int | None = None) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="ignore")
+
+
+_PROMPT_TEMPLATE_CACHE: dict[str, str] | None = None
+
+
+def load_prompt_templates() -> dict[str, str]:
+    """读取 Markdown 提示词模板文件中的命名块。"""
+    global _PROMPT_TEMPLATE_CACHE
+    if _PROMPT_TEMPLATE_CACHE is not None:
+        return _PROMPT_TEMPLATE_CACHE
+
+    text = read_text_safe(PROMPT_TEMPLATE_PATH)
+    if not text:
+        raise SystemExit(f"提示词模板文件不存在或为空: {PROMPT_TEMPLATE_PATH}")
+
+    pattern = re.compile(
+        r"<!--\s*prompt:([a-zA-Z0-9_-]+)\s*-->\s*(.*?)\s*<!--\s*/prompt\s*-->",
+        re.DOTALL,
+    )
+    templates = {name: body.strip() for name, body in pattern.findall(text)}
+    if not templates:
+        raise SystemExit(f"提示词模板文件没有可用模板块: {PROMPT_TEMPLATE_PATH}")
+    _PROMPT_TEMPLATE_CACHE = templates
+    return templates
+
+
+def prompt_template(name: str) -> str:
+    """按名称读取单个提示词模板。"""
+    templates = load_prompt_templates()
+    try:
+        return templates[name]
+    except KeyError as exc:
+        raise SystemExit(f"提示词模板缺失: {name}") from exc
+
+
+def render_prompt_template(name: str, values: dict[str, Any] | None = None) -> str:
+    """用 {{name}} 占位符渲染提示词模板。"""
+    template = prompt_template(name)
+    values = values or {}
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1).strip()
+        if key not in values:
+            raise SystemExit(f"提示词模板 {name} 缺少变量: {key}")
+        return str(values[key])
+
+    return re.sub(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", replace, template).strip()
 
 
 def stable_hash(path: Path, max_bytes: int = 1024 * 1024) -> str:
@@ -661,32 +709,16 @@ def call_llm_review_layer(
         [
             {
                 "role": "system",
-                "content": (
-                    "你是机器人售后问题的第一层审查器。只判断输入是否属于机器人售后范围，"
-                    "不要判断硬件风险、是否人工介入或处理路径。只输出 JSON。"
-                ),
+                "content": prompt_template("review_system"),
             },
             {
                 "role": "user",
-                "content": "\n".join(
-                    [
-                        "请审查下面的学生问题和日志，返回 JSON：",
-                        "{",
-                        '  "related": true/false,',
-                        '  "reason": "一句话说明审查依据",',
-                        '  "confidence": 0.0到1.0',
-                        "}",
-                        "",
-                        "判定规则：",
-                        "- related 只表示是否和机器人/ROS/传感器/底盘/功能包售后相关。",
-                        "- 不要判断是否硬件风险、是否需要人工介入，也不要做 FAQ 或 Debug 分类。",
-                        "",
-                        "学生问题：",
-                        question.strip() or "无",
-                        "",
-                        "学生日志：",
-                        log_text.strip() or "无",
-                    ]
+                "content": render_prompt_template(
+                    "review_user",
+                    {
+                        "question": question.strip() or "无",
+                        "log_text": log_text.strip() or "无",
+                    },
                 ),
             },
         ],
@@ -714,51 +746,17 @@ def call_llm_classification_layer(
         [
             {
                 "role": "system",
-                "content": (
-                    "你是机器人售后问题的第二层分类器。基于第一层审查结果，"
-                    "判断硬件风险、是否需要人工介入，并把问题分到固定处理路径。"
-                    "只输出 JSON，不要输出解释性正文。"
-                ),
+                "content": prompt_template("classification_system"),
             },
             {
                 "role": "user",
-                "content": "\n".join(
-                    [
-                        "请分类下面的学生问题和日志，返回 JSON：",
-                        "{",
-                        '  "category": "hardware_risk|project_debug|simple_faq|robot_general|out_of_scope",',
-                        '  "difficulty": "human_review|complex|simple|medium|ignore_or_manual",',
-                        '  "hardware_risk": true/false,',
-                        '  "need_human": true/false,',
-                        '  "hardware_risk_keywords": ["命中的风险词"],',
-                        '  "need_project_context": true/false,',
-                        '  "missing_info": ["还需要补充的信息"],',
-                        '  "reason": "一句话说明分类依据",',
-                        '  "confidence": 0.0到1.0',
-                        "}",
-                        "",
-                        "分类定义：",
-                        "- hardware_risk：有硬件安全风险，直接人工处理。",
-                        "- project_debug：需要结合项目文件、日志、launch/config/src 等做 Debug。",
-                        "- simple_faq：型号、参数、默认配置、账号、基础接线等简单 FAQ 可以处理。",
-                        "- robot_general：机器人售后相关，但暂时不确定是否需要项目上下文。",
-                        "- out_of_scope：和机器人售后无关。",
-                        "",
-                        "安全规则：",
-                        "- 出现冒烟、短路、烧坏、异味、明显过热、电源反接等，hardware_risk 和 need_human 必须为 true。",
-                        "- hardware_risk 或 need_human 为 true 时，category 必须是 hardware_risk，difficulty 必须是 human_review。",
-                        "",
-                        "注意：need_project_context 只是第二层的检索倾向，是否进入第四层模型由第三层检索结果最终决定。",
-                        "",
-                        "第一层审查结果：",
-                        json.dumps(review, ensure_ascii=False),
-                        "",
-                        "学生问题：",
-                        question.strip() or "无",
-                        "",
-                        "学生日志：",
-                        log_text.strip() or "无",
-                    ]
+                "content": render_prompt_template(
+                    "classification_user",
+                    {
+                        "review_json": json.dumps(review, ensure_ascii=False),
+                        "question": question.strip() or "无",
+                        "log_text": log_text.strip() or "无",
+                    },
                 ),
             },
         ],
@@ -988,6 +986,7 @@ def make_debug_prompt(
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
     contexts: list[dict[str, Any]],
+    debug_rule_1: str | None = None,
 ) -> str:
     """生成发送给项目 Debug 模型层的完整提示词。"""
     faq_section = "无 FAQ 命中。"
@@ -1016,66 +1015,29 @@ def make_debug_prompt(
     review = triage.get("review", {})
     classification = triage.get("classification", {})
 
-    return "\n".join(
-        [
-            "你是机器人售后工程师，正在辅助内部售后人员回复学生。",
-            "",
-            "工作规则：",
-            "1. 只根据学生问题、日志、FAQ 和项目片段给出判断；没有依据就说明需要补充信息。",
-            "2. 不要要求学生修改源码，除非项目片段和日志能明确支撑这个建议。",
-            "3. 先排查连接、权限、参数、启动顺序、依赖和硬件状态，再考虑代码 bug。",
-            "4. 遇到电源短路、烧坏、冒烟、异常发热，建议立即断电并转人工。",
-            "5. 输出要适合售后人员审核后直接发给学生。",
-            "",
-            f"项目名称：{project_name}",
-            "",
-            "第一层审查：",
-            f"- 提供方：{review.get('provider', 'unknown')}",
-            f"- 是否通过：{triage.get('review_passed')}",
-            f"- 是否相关：{triage.get('related')}",
-            f"- 理由：{review.get('reason', '') or '无'}",
-            "",
-            "第二层分类：",
-            f"- 提供方：{classification.get('provider', 'unknown')}",
-            f"- 类别：{triage.get('category')}",
-            f"- 难度：{triage.get('difficulty')}",
-            f"- 硬件风险：{bool(triage.get('hardware_risk'))}",
-            f"- 需要人工：{triage.get('need_human')}",
-            f"- 需要项目上下文：{triage.get('need_project_context')}",
-            f"- 理由：{classification.get('reason', '') or '无'}",
-            f"- 缺少信息：{missing}",
-            "",
-            "学生问题：",
-            question.strip(),
-            "",
-            "学生日志：",
-            "```text",
-            log_section,
-            "```",
-            "",
-            "FAQ 命中：",
-            faq_section,
-            "",
-            "项目相关片段：",
-            context_section,
-            "",
-            "请按下面格式输出：",
-            "## 初步结论",
-            "用 1-3 句话说明最可能原因和置信度。",
-            "",
-            "## 依据",
-            "列出你引用的日志或项目文件依据。",
-            "",
-            "## 排查步骤",
-            "给学生可以按顺序执行的步骤，优先使用安全、可逆、低风险动作。",
-            "",
-            "## 需要补充的信息",
-            "如果信息不足，列出最多 5 项。",
-            "",
-            "## 推荐回复",
-            "写一段售后人员可以直接发给学生的中文回复。",
-        ]
-    ).strip()
+    return render_prompt_template(
+        "debug_prompt",
+        {
+            "debug_rule_1": debug_rule_1 or prompt_template("debug_rule_standard"),
+            "project_name": project_name,
+            "review_provider": review.get("provider", "unknown"),
+            "review_passed": triage.get("review_passed"),
+            "related": triage.get("related"),
+            "review_reason": review.get("reason", "") or "无",
+            "classification_provider": classification.get("provider", "unknown"),
+            "category": triage.get("category"),
+            "difficulty": triage.get("difficulty"),
+            "hardware_risk": bool(triage.get("hardware_risk")),
+            "need_human": triage.get("need_human"),
+            "need_project_context": triage.get("need_project_context"),
+            "classification_reason": classification.get("reason", "") or "无",
+            "missing_info": missing,
+            "question": question.strip(),
+            "log_text": log_section,
+            "faq_section": faq_section,
+            "context_section": context_section,
+        },
+    )
 
 
 def make_codex_debug_prompt(
@@ -1087,23 +1049,16 @@ def make_codex_debug_prompt(
     contexts: list[dict[str, Any]],
 ) -> str:
     """生成给本地 Codex CLI 的提示词，允许它在只读沙盒中自行检索项目文件。"""
-    base_prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
-    base_prompt = base_prompt.replace(
-        "1. 只根据学生问题、日志、FAQ 和项目片段给出判断；没有依据就说明需要补充信息。",
-        "1. 先根据学生问题、日志和项目片段判断；项目片段可能不完整，你必须在当前项目目录中用只读方式自行检索相关文件后再下结论。",
+    base_prompt = make_debug_prompt(
+        project_name,
+        question,
+        log_text,
+        triage,
+        faq_hits,
+        contexts,
+        debug_rule_1=prompt_template("debug_rule_codex"),
     )
-    codex_instructions = "\n".join(
-        [
-            "Codex 本地检索要求：",
-            "- 你当前运行在项目根目录，沙盒是只读；可以读取和检索文件，但不要创建、修改或删除任何文件。",
-            "- 不要只依赖下方第三层项目片段；这些片段可能检索不准。",
-            "- 优先查找学生问题中提到的文件名、脚本名、节点名相关模块。",
-            "- 回答的“依据”必须列出你实际查看过的项目文件路径，以及支撑判断的关键函数、参数、topic、服务或调用关系。",
-            "- 如果没有找到相关文件或关键调用，明确说明你检索了什么，以及还缺少什么日志或文件。",
-            "",
-        ]
-    )
-    return f"{codex_instructions}{base_prompt}"
+    return f"{prompt_template('codex_debug_prefix')}\n\n{base_prompt}"
 
 
 def make_report(
@@ -1235,7 +1190,7 @@ def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None
         [
             {
                 "role": "system",
-                "content": "你是谨慎的机器人售后技术助手，只输出有依据的排查建议。",
+                "content": prompt_template("debug_llm_system"),
             },
             {"role": "user", "content": prompt},
         ],
