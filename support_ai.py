@@ -14,6 +14,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -24,6 +26,10 @@ SCHEMA_VERSION = 1
 LLM_DEFAULT_CONFIG = "ai_config.local.json"
 LLM_DEFAULT_BASE_URL = "https://example.com/api/v1"
 LLM_DEFAULT_MODEL = "your-model-name"
+CODEX_BIN_ENV_NAME = "CODEX_BIN"
+CODEX_DEFAULT_BIN = "codex"
+CODEX_SANDBOX_MODE = "read-only"
+CODEX_DEFAULT_TIMEOUT_SECONDS = 600
 LLM_API_KEY_ENV_NAMES = ("AFTERSALES_AI_API_KEY", "OPENAI_API_KEY")
 LLM_BASE_URL_ENV_NAMES = ("AFTERSALES_AI_BASE_URL", "OPENAI_BASE_URL")
 LLM_MODEL_ENV_NAMES = ("AFTERSALES_AI_MODEL", "OPENAI_MODEL")
@@ -1072,6 +1078,34 @@ def make_debug_prompt(
     ).strip()
 
 
+def make_codex_debug_prompt(
+    project_name: str,
+    question: str,
+    log_text: str,
+    triage: dict[str, Any],
+    faq_hits: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> str:
+    """生成给本地 Codex CLI 的提示词，允许它在只读沙盒中自行检索项目文件。"""
+    base_prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits, contexts)
+    base_prompt = base_prompt.replace(
+        "1. 只根据学生问题、日志、FAQ 和项目片段给出判断；没有依据就说明需要补充信息。",
+        "1. 先根据学生问题、日志和项目片段判断；项目片段可能不完整，你必须在当前项目目录中用只读方式自行检索相关文件后再下结论。",
+    )
+    codex_instructions = "\n".join(
+        [
+            "Codex 本地检索要求：",
+            "- 你当前运行在项目根目录，沙盒是只读；可以读取和检索文件，但不要创建、修改或删除任何文件。",
+            "- 不要只依赖下方第三层项目片段；这些片段可能检索不准。",
+            "- 优先查找学生问题中提到的文件名、脚本名、节点名相关模块。",
+            "- 回答的“依据”必须列出你实际查看过的项目文件路径，以及支撑判断的关键函数、参数、topic、服务或调用关系。",
+            "- 如果没有找到相关文件或关键调用，明确说明你检索了什么，以及还缺少什么日志或文件。",
+            "",
+        ]
+    )
+    return f"{codex_instructions}{base_prompt}"
+
+
 def make_report(
     index_data: dict[str, Any],
     question: str,
@@ -1210,6 +1244,87 @@ def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None
     )
 
 
+def resolve_codex_bin(codex_bin: str | None = None) -> str:
+    """按命令行参数、环境变量、PATH 默认值解析 Codex CLI 可执行文件。"""
+    resolved = (codex_bin or os.getenv(CODEX_BIN_ENV_NAME) or CODEX_DEFAULT_BIN).strip()
+    return resolved or CODEX_DEFAULT_BIN
+
+
+def call_codex_cli(
+    prompt: str,
+    *,
+    cwd: Path,
+    codex_bin: str | None = None,
+    timeout_seconds: int = CODEX_DEFAULT_TIMEOUT_SECONDS,
+) -> str:
+    """通过本地 Codex CLI 的非交互模式生成第四层诊断文本。"""
+    if timeout_seconds <= 0:
+        raise SystemExit("--codex-timeout 必须大于 0。")
+    if not cwd.exists() or not cwd.is_dir():
+        raise SystemExit(f"Codex CLI 工作目录不存在或不是文件夹: {cwd}")
+
+    resolved_bin = resolve_codex_bin(codex_bin)
+    output_path: Path | None = None
+
+    def cleanup_output() -> None:
+        if output_path:
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+
+    try:
+        with tempfile.NamedTemporaryFile(prefix="support_ai_codex_", suffix=".md", delete=False) as fh:
+            output_path = Path(fh.name)
+
+        command = [
+            resolved_bin,
+            "exec",
+            "--sandbox",
+            CODEX_SANDBOX_MODE,
+            "-o",
+            str(output_path),
+            "-",
+        ]
+        completed = subprocess.run(
+            command,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            cwd=str(cwd),
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        cleanup_output()
+        raise SystemExit(
+            f"找不到 Codex CLI: {resolved_bin}。请设置 {CODEX_BIN_ENV_NAME} 或传入 --codex-bin。"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        cleanup_output()
+        raise SystemExit(
+            f"调用 Codex CLI 超时（{timeout_seconds} 秒），可增大 --codex-timeout。"
+        ) from exc
+    except OSError as exc:
+        cleanup_output()
+        raise SystemExit(f"调用 Codex CLI 失败: {exc}") from exc
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if completed.returncode != 0:
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        cleanup_output()
+        raise SystemExit(f"调用 Codex CLI 失败: {detail[:2000]}")
+
+    answer = ""
+    if output_path and output_path.exists():
+        answer = read_text_safe(output_path).strip()
+    cleanup_output()
+    return answer or stdout
+
+
 def append_history(history_path: Path, payload: dict[str, Any]) -> None:
     """向 JSONL 历史文件追加一条售后案例处理记录。"""
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1248,6 +1363,9 @@ def command_inspect(args: argparse.Namespace) -> None:
 
 def command_ask(args: argparse.Namespace) -> None:
     """CLI 的 ask 子命令：分流问题并生成诊断报告。"""
+    if args.call_llm and args.call_codex:
+        raise SystemExit("--call-llm 和 --call-codex 只能选择一个。")
+
     index_data = load_json(Path(args.index), default=None)
     if not index_data:
         raise SystemExit(f"索引不存在: {args.index}")
@@ -1293,8 +1411,9 @@ def command_ask(args: argparse.Namespace) -> None:
     triage["enter_fourth_layer"] = should_enter_fourth_layer(triage, faq_hits, contexts)
 
     llm_answer = None
-    if args.call_llm and triage["enter_fourth_layer"]:
-        prompt = make_debug_prompt(
+    if (args.call_llm or args.call_codex) and triage["enter_fourth_layer"]:
+        prompt_factory = make_debug_prompt if args.call_llm else make_codex_debug_prompt
+        prompt = prompt_factory(
             index_data.get("project_name", "unknown"),
             question,
             log_text,
@@ -1302,7 +1421,15 @@ def command_ask(args: argparse.Namespace) -> None:
             faq_hits,
             contexts,
         )
-        llm_answer = call_openai_compatible(prompt, llm_config)
+        if args.call_llm:
+            llm_answer = call_openai_compatible(prompt, llm_config)
+        else:
+            llm_answer = call_codex_cli(
+                prompt,
+                cwd=Path(index_data["project_root"]),
+                codex_bin=args.codex_bin,
+                timeout_seconds=args.codex_timeout,
+            )
 
     report = make_report(index_data, question, log_text, triage, faq_hits, contexts, llm_answer)
 
@@ -1371,6 +1498,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="两层审查分类模式；本地关键词分流已移除，auto 和 llm 都需要模型服务 Key",
     )
     ask_parser.add_argument("--call-llm", action="store_true", help="调用模型服务生成第四层诊断回答")
+    ask_parser.add_argument("--call-codex", action="store_true", help="调用本地 Codex CLI 生成第四层诊断回答")
+    ask_parser.add_argument(
+        "--codex-bin",
+        help=f"Codex CLI 可执行文件路径；默认读取 {CODEX_BIN_ENV_NAME}，否则使用 PATH 中的 codex",
+    )
+    ask_parser.add_argument(
+        "--codex-timeout",
+        type=int,
+        default=CODEX_DEFAULT_TIMEOUT_SECONDS,
+        help="Codex CLI 调用超时时间（秒）",
+    )
     ask_parser.set_defaults(func=command_ask)
 
     return parser
