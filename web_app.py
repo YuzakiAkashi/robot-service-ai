@@ -172,16 +172,16 @@ HTML = """<!doctype html>
       <label>学生问题
         <textarea name="question" required placeholder="粘贴学生原始问题"></textarea>
       </label>
+      <div class="row">
+        <input id="saveQuestion" name="save_question" type="checkbox" checked>
+        <label for="saveQuestion" style="margin:0;font-weight:400;">保存问题到 Cookie</label>
+      </div>
       <label>日志
         <textarea name="log_text" placeholder="可选：粘贴终端日志"></textarea>
       </label>
       <label>输出报告路径
         <input name="out" value="reports/web_last.md">
       </label>
-      <div class="row">
-        <input id="callCodex" name="call_codex" type="checkbox">
-        <label for="callCodex" style="margin:0;font-weight:400;">调用 Codex CLI 生成第四层回答</label>
-      </div>
       <button id="submitBtn" type="submit">开始分析</button>
     </form>
     <section class="result">
@@ -194,6 +194,40 @@ HTML = """<!doctype html>
     const output = document.getElementById('output');
     const status = document.getElementById('status');
     const submitBtn = document.getElementById('submitBtn');
+    const saveQuestion = document.getElementById('saveQuestion');
+    const savedFieldNames = ['index', 'faq', 'question', 'log_text', 'out'];
+
+    function getCookie(name) {
+      const prefix = `${name}=`;
+      return document.cookie
+        .split(';')
+        .map(item => item.trim())
+        .find(item => item.startsWith(prefix))
+        ?.slice(prefix.length) || '';
+    }
+
+    function setCookie(name, value, days) {
+      const expires = new Date(Date.now() + days * 864e5).toUTCString();
+      document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
+    }
+
+    function deleteCookie(name) {
+      document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax`;
+    }
+
+    const savedForm = getCookie('support_ai_form');
+    if (savedForm) {
+      try {
+        const values = JSON.parse(decodeURIComponent(savedForm));
+        savedFieldNames.forEach((name) => {
+          if (values[name] !== undefined && form.elements[name]) {
+            form.elements[name].value = values[name];
+          }
+        });
+      } catch (err) {
+        deleteCookie('support_ai_form');
+      }
+    }
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -203,7 +237,15 @@ HTML = """<!doctype html>
       output.textContent = '';
 
       const data = Object.fromEntries(new FormData(form).entries());
-      data.call_codex = document.getElementById('callCodex').checked;
+      if (saveQuestion.checked) {
+        const values = {};
+        savedFieldNames.forEach((name) => {
+          values[name] = data[name] || '';
+        });
+        setCookie('support_ai_form', JSON.stringify(values), 30);
+      } else {
+        deleteCookie('support_ai_form');
+      }
 
       try {
         const response = await fetch('/api/ask', {
@@ -305,9 +347,8 @@ class Handler(BaseHTTPRequestHandler):
             str(log_path),
             "--out",
             out_path,
+            "--call-codex",
         ]
-        if bool(payload.get("call_codex")):
-            command.append("--call-codex")
         return command, out_path
 
     def _stream_ask(self, payload: dict[str, object]) -> None:

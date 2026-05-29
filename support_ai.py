@@ -411,7 +411,6 @@ def command_ask(args: argparse.Namespace) -> None:
     llm_config = load_llm_configs(args.llm_config)                              #加载LLM配置
     review_config = layer_llm_config(llm_config, "review")
     classification_config = layer_llm_config(llm_config, "classification")
-    print("## 运行进度\n- 正在进行第一层审查...\n", flush=True)
     try:
         review = call_llm_review_layer(question, log_text, review_config)       #第一层：审查层
     except (SystemExit, ValueError) as exc:
@@ -432,7 +431,6 @@ def command_ask(args: argparse.Namespace) -> None:
             print(f"已生成报告: {out_path}")
         raise SystemExit(0)
 
-    print("## 运行进度\n- 正在进行第二层分类...\n", flush=True)
     try:                                            
         classification = call_llm_classification_layer(                         #第二层：分类层
             question,
@@ -535,7 +533,6 @@ def command_ask(args: argparse.Namespace) -> None:
         print(prompt_section, end="\n\n", flush=True)
 
         if args.call_codex:
-            print("## 运行进度\n- 正在调用 Codex CLI 第四层 Debug...\n", flush=True)
             llm_answer = call_codex_cli(                                #第四层：CodexCLI
                 prompt,
                 cwd=Path(index_data["project_root"]),
