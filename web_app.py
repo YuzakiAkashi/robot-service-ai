@@ -139,18 +139,71 @@ HTML = """<!doctype html>
       color: var(--muted);
       font-size: 13px;
     }
-    pre {
+    .markdown-output {
       min-height: 420px;
       margin: 0;
       padding: 16px;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: #fff;
-      white-space: pre-wrap;
+      overflow: auto;
       word-break: break-word;
       line-height: 1.55;
-      font-family: Consolas, "Microsoft YaHei", monospace;
       font-size: 13px;
+    }
+    .markdown-output h1,
+    .markdown-output h2,
+    .markdown-output h3,
+    .markdown-output h4 {
+      margin: 16px 0 8px;
+      line-height: 1.35;
+      letter-spacing: 0;
+    }
+    .markdown-output h1 { font-size: 22px; }
+    .markdown-output h2 { font-size: 18px; }
+    .markdown-output h3 { font-size: 15px; }
+    .markdown-output h4 { font-size: 14px; }
+    .markdown-output p {
+      margin: 8px 0;
+    }
+    .markdown-output ul,
+    .markdown-output ol {
+      margin: 8px 0 8px 22px;
+      padding: 0;
+    }
+    .markdown-output li {
+      margin: 4px 0;
+    }
+    .markdown-output pre {
+      margin: 10px 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      overflow-x: auto;
+      white-space: pre;
+      font-family: Consolas, "Microsoft YaHei", monospace;
+      font-size: 12px;
+    }
+    .markdown-output code {
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: #eef2f7;
+      font-family: Consolas, "Microsoft YaHei", monospace;
+      font-size: .94em;
+    }
+    .markdown-output pre code {
+      padding: 0;
+      background: transparent;
+      border-radius: 0;
+      font-size: inherit;
+    }
+    .markdown-output blockquote {
+      margin: 10px 0;
+      padding: 6px 12px;
+      border-left: 3px solid var(--line);
+      color: var(--muted);
+      background: #fafbfc;
     }
     .error { color: var(--danger); }
     @media (max-width: 820px) {
@@ -186,7 +239,7 @@ HTML = """<!doctype html>
     </form>
     <section class="result">
       <div id="status" class="status">等待输入</div>
-      <pre id="output">结果会显示在这里。</pre>
+      <div id="output" class="markdown-output">结果会显示在这里。</div>
     </section>
   </main>
   <script>
@@ -215,6 +268,106 @@ HTML = """<!doctype html>
       document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax`;
     }
 
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderInline(text) {
+      return escapeHtml(text)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+    }
+
+    function renderMarkdown(text) {
+      const lines = String(text || '').replace(/\\r\\n/g, '\\n').split('\\n');
+      const html = [];
+      let inCode = false;
+      let codeLines = [];
+      let listType = '';
+
+      function closeList() {
+        if (listType) {
+          html.push(`</${listType}>`);
+          listType = '';
+        }
+      }
+
+      function openList(type) {
+        if (listType !== type) {
+          closeList();
+          html.push(`<${type}>`);
+          listType = type;
+        }
+      }
+
+      for (const line of lines) {
+        if (line.trim().startsWith('```')) {
+          if (inCode) {
+            html.push(`<pre><code>${escapeHtml(codeLines.join('\\n'))}</code></pre>`);
+            codeLines = [];
+            inCode = false;
+          } else {
+            closeList();
+            inCode = true;
+          }
+          continue;
+        }
+
+        if (inCode) {
+          codeLines.push(line);
+          continue;
+        }
+
+        if (!line.trim()) {
+          closeList();
+          continue;
+        }
+
+        const heading = line.match(/^(#{1,4})\\s+(.+)$/);
+        if (heading) {
+          closeList();
+          const level = heading[1].length;
+          html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+          continue;
+        }
+
+        const unordered = line.match(/^\\s*[-*]\\s+(.+)$/);
+        if (unordered) {
+          openList('ul');
+          html.push(`<li>${renderInline(unordered[1])}</li>`);
+          continue;
+        }
+
+        const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
+        if (ordered) {
+          openList('ol');
+          html.push(`<li>${renderInline(ordered[1])}</li>`);
+          continue;
+        }
+
+        const quote = line.match(/^>\\s?(.+)$/);
+        if (quote) {
+          closeList();
+          html.push(`<blockquote>${renderInline(quote[1])}</blockquote>`);
+          continue;
+        }
+
+        closeList();
+        html.push(`<p>${renderInline(line)}</p>`);
+      }
+
+      if (inCode) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join('\\n'))}</code></pre>`);
+      }
+      closeList();
+      return html.join('');
+    }
+
     const savedForm = getCookie('support_ai_form');
     if (savedForm) {
       try {
@@ -234,7 +387,7 @@ HTML = """<!doctype html>
       submitBtn.disabled = true;
       status.textContent = '正在分析...';
       status.className = 'status';
-      output.textContent = '';
+      output.innerHTML = '';
 
       const data = Object.fromEntries(new FormData(form).entries());
       if (saveQuestion.checked) {
@@ -259,19 +412,40 @@ HTML = """<!doctype html>
         const reader = response.body.getReader();
         const decoder = new TextDecoder('utf-8');
         let fullText = '';
+        let paintPending = false;
+        let lastPaint = 0;
+
+        function paintPlain(force = false) {
+          const now = performance.now();
+          if (!force && now - lastPaint < 120) return;
+          lastPaint = now;
+          output.textContent = fullText;
+          output.scrollTop = output.scrollHeight;
+        }
+
+        function schedulePaint() {
+          if (paintPending) return;
+          paintPending = true;
+          requestAnimationFrame(() => {
+            paintPlain();
+            paintPending = false;
+          });
+        }
+
         while (true) {
           const {value, done} = await reader.read();
           if (done) break;
           const text = decoder.decode(value, {stream: true});
           fullText += text;
-          output.textContent += text;
-          output.scrollTop = output.scrollHeight;
+          schedulePaint();
         }
         const tail = decoder.decode();
         if (tail) {
           fullText += tail;
-          output.textContent += tail;
         }
+        paintPlain(true);
+        output.innerHTML = renderMarkdown(fullText);
+        output.scrollTop = output.scrollHeight;
         if (response.ok && !fullText.includes('[前端] 执行失败')) {
           status.textContent = '完成';
         } else {
@@ -369,8 +543,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         if process.stdout is not None:
+            fd = process.stdout.fileno()
             while True:
-                chunk = process.stdout.read(1)
+                chunk = os.read(fd, 512)
                 if not chunk:
                     break
                 self._write_text(decoder.decode(chunk))

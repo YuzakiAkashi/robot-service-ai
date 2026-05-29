@@ -443,11 +443,11 @@ def call_codex_cli(
             if process.stdout is None:
                 return
             while True:
-                chunk = process.stdout.read(1)
-                if not chunk:
+                line = process.stdout.readline()
+                if not line:
                     break
-                captured_output.append(chunk)
-                print(chunk, end="", flush=True)
+                captured_output.append(line)
+                print(line, end="", flush=True)
 
         output_thread = threading.Thread(target=stream_process_output, daemon=True)
         output_thread.start()
