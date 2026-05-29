@@ -2,55 +2,43 @@
 """
 机器人内部售后 AI 助手 MVP。
 
-用于只读索引机器人项目、审查和分类学生问题、匹配 FAQ、检索项目片段，
+用于只读索引机器人项目、审查和分类学生问题、匹配 FAQ，
 并生成可交给代码模型继续排查的项目 Debug 提示。
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import hashlib
-import json
-import os
-import re
-import subprocess
-import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
+from support_llm import (
+    CODEX_BIN_ENV_NAME,
+    CODEX_DEFAULT_TIMEOUT_SECONDS,
+    LLM_DEFAULT_CONFIG,
+    call_codex_cli,
+    call_llm_classification_layer,
+    call_llm_review_layer,
+    first_layer_passed,
+    layer_llm_config,
+    load_llm_configs,
+    make_codex_debug_prompt,
+    make_debug_prompt,
+)
+from support_utils import (
+    append_history,
+    as_bool,
+    extract_terms,
+    load_json,
+    normalize,
+    now_iso,
+    read_text_safe,
+    stable_hash,
+    write_json,
+)
+
 
 SCHEMA_VERSION = 1
-LLM_DEFAULT_CONFIG = "ai_config.local.json"
-LLM_DEFAULT_BASE_URL = "https://example.com/api/v1"
-LLM_DEFAULT_MODEL = "your-model-name"
-CODEX_BIN_ENV_NAME = "CODEX_BIN"
-CODEX_DEFAULT_BIN = "codex"
-CODEX_SANDBOX_MODE = "read-only"
-CODEX_DEFAULT_TIMEOUT_SECONDS = 600
-PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompts" / "ai_prompts.md"
-LLM_API_KEY_ENV_NAMES = ("AFTERSALES_AI_API_KEY", "OPENAI_API_KEY")
-LLM_BASE_URL_ENV_NAMES = ("AFTERSALES_AI_BASE_URL", "OPENAI_BASE_URL")
-LLM_MODEL_ENV_NAMES = ("AFTERSALES_AI_MODEL", "OPENAI_MODEL")
-LLM_LAYER_ENV_NAMES = {
-    "review": {
-        "api_key": ("AFTERSALES_REVIEW_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
-        "base_url": ("AFTERSALES_REVIEW_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
-        "model": ("AFTERSALES_REVIEW_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
-    },
-    "classification": {
-        "api_key": ("AFTERSALES_CLASSIFICATION_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
-        "base_url": ("AFTERSALES_CLASSIFICATION_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
-        "model": ("AFTERSALES_CLASSIFICATION_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
-    },
-    "debug": {
-        "api_key": ("AFTERSALES_DEBUG_AI_API_KEY",) + LLM_API_KEY_ENV_NAMES,
-        "base_url": ("AFTERSALES_DEBUG_AI_BASE_URL",) + LLM_BASE_URL_ENV_NAMES,
-        "model": ("AFTERSALES_DEBUG_AI_MODEL",) + LLM_MODEL_ENV_NAMES,
-    },
-}
 
 IGNORED_DIRS = {
     ".git",
@@ -122,91 +110,6 @@ IMPORTANT_NAMES = {
     "requirements.txt",
     "manifest.xml",
 }
-
-
-def now_iso() -> str:
-    """返回当前本地时间的 ISO 字符串，不包含微秒。"""
-    return dt.datetime.now().replace(microsecond=0).isoformat()
-
-
-def read_text_safe(path: Path, max_bytes: int | None = None) -> str:
-    """用常见编码安全读取文本文件，读取失败时返回空字符串。"""
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return ""
-    if max_bytes is not None and len(data) > max_bytes:
-        data = data[:max_bytes]
-    for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="ignore")
-
-
-_PROMPT_TEMPLATE_CACHE: dict[str, str] | None = None
-
-
-def load_prompt_templates() -> dict[str, str]:
-    """读取 Markdown 提示词模板文件中的命名块。"""
-    global _PROMPT_TEMPLATE_CACHE
-    if _PROMPT_TEMPLATE_CACHE is not None:
-        return _PROMPT_TEMPLATE_CACHE
-
-    text = read_text_safe(PROMPT_TEMPLATE_PATH)
-    if not text:
-        raise SystemExit(f"提示词模板文件不存在或为空: {PROMPT_TEMPLATE_PATH}")
-
-    pattern = re.compile(
-        r"<!--\s*prompt:([a-zA-Z0-9_-]+)\s*-->\s*(.*?)\s*<!--\s*/prompt\s*-->",
-        re.DOTALL,
-    )
-    templates = {name: body.strip() for name, body in pattern.findall(text)}
-    if not templates:
-        raise SystemExit(f"提示词模板文件没有可用模板块: {PROMPT_TEMPLATE_PATH}")
-    _PROMPT_TEMPLATE_CACHE = templates
-    return templates
-
-
-def prompt_template(name: str) -> str:
-    """按名称读取单个提示词模板。"""
-    templates = load_prompt_templates()
-    try:
-        return templates[name]
-    except KeyError as exc:
-        raise SystemExit(f"提示词模板缺失: {name}") from exc
-
-
-def render_prompt_template(name: str, values: dict[str, Any] | None = None) -> str:
-    """用 {{name}} 占位符渲染提示词模板。"""
-    template = prompt_template(name)
-    values = values or {}
-
-    def replace(match: re.Match[str]) -> str:
-        key = match.group(1).strip()
-        if key not in values:
-            raise SystemExit(f"提示词模板 {name} 缺少变量: {key}")
-        return str(values[key])
-
-    return re.sub(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", replace, template).strip()
-
-
-def stable_hash(path: Path, max_bytes: int = 1024 * 1024) -> str:
-    """计算文件前 max_bytes 字节的稳定 SHA-1 哈希。"""
-    digest = hashlib.sha1()
-    try:
-        with path.open("rb") as fh:
-            remaining = max_bytes
-            while remaining > 0:
-                chunk = fh.read(min(65536, remaining))
-                if not chunk:
-                    break
-                digest.update(chunk)
-                remaining -= len(chunk)
-    except OSError:
-        return ""
-    return digest.hexdigest()
 
 
 def is_text_file(path: Path) -> bool:
@@ -327,493 +230,6 @@ def build_index(project_root: Path, name: str | None, max_file_bytes: int) -> di
     }
 
 
-def load_json(path: Path, default: Any) -> Any:
-    """读取 JSON 文件；文件不存在时返回默认值。"""
-    if not path.exists():
-        return default
-    try:
-        return json.loads(read_text_safe(path))
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"JSON 格式错误: {path} ({exc})") from exc
-
-
-def write_json(path: Path, data: Any) -> None:
-    """以 UTF-8 写入 JSON 文件，并按需创建父目录。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def is_placeholder_api_key(value: str) -> bool:
-    """判断 API Key 是否为空或仍是占位文本。"""
-    stripped = value.strip()
-    if not stripped:
-        return True
-    placeholders = {"YOUR_API_KEY_HERE", "your-api-key-here", "替换成你的 API Key"}
-    return stripped in placeholders or "替换" in stripped or "你的" in stripped
-
-
-def is_placeholder_model(value: str) -> bool:
-    """判断模型名是否为空或仍是占位文本。"""
-    stripped = value.strip()
-    if not stripped:
-        return True
-    placeholders = {"YOUR_MODEL_NAME", "your-model-name", "替换成你的模型名"}
-    return (
-        stripped in placeholders
-        or stripped.startswith("your-")
-        or "替换" in stripped
-        or "你的" in stripped
-    )
-
-
-def is_placeholder_base_url(value: str) -> bool:
-    """判断 API Base URL 是否为空或仍是占位文本。"""
-    stripped = value.strip()
-    if not stripped:
-        return True
-    return stripped in {"https://example.com/api/v1", "your-base-url"} or "example.com" in stripped
-
-
-def load_config_object(path: Path, label: str) -> dict[str, Any]:
-    """读取可选 JSON 配置文件，并保证内容是对象。"""
-    if not path.exists():
-        return {}
-    loaded = load_json(path, default={})
-    if not isinstance(loaded, dict):
-        raise SystemExit(f"{label} 配置文件必须是 JSON 对象: {path}")
-    return loaded
-
-
-def layer_file_config(file_config: dict[str, Any], layer: str | None) -> dict[str, Any]:
-    """合并顶层配置和指定层级配置；层级配置优先。"""
-    merged = {
-        "api_key": file_config.get("api_key", ""),
-        "base_url": file_config.get("base_url", LLM_DEFAULT_BASE_URL),
-        "model": file_config.get("model", LLM_DEFAULT_MODEL),
-    }
-    if not layer:
-        return merged
-    layer_config = file_config.get(layer, {})
-    if layer_config is None:
-        return merged
-    if not isinstance(layer_config, dict):
-        raise SystemExit(f"AI 配置中的 {layer} 必须是 JSON 对象")
-    merged.update({key: value for key, value in layer_config.items() if value is not None})
-    return merged
-
-
-def first_config_value(
-    file_config: dict[str, Any],
-    key: str,
-    env_names: tuple[str, ...],
-    default: str,
-) -> str:
-    """按环境变量、配置文件、默认值的优先级读取字符串配置。"""
-    for env_name in env_names:
-        value = os.getenv(env_name)
-        if value:
-            return value.strip()
-    value = file_config.get(key, default)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def load_llm_config(config_path: str | None = None, layer: str | None = None) -> dict[str, Any]:
-    """从本地 JSON 配置和环境变量读取某一层的模型服务 API 设置。"""
-    path = Path(config_path or os.getenv("AFTERSALES_AI_CONFIG", LLM_DEFAULT_CONFIG))
-    file_config = load_config_object(path, "AI")
-    layer_config = layer_file_config(file_config, layer)
-    env_names = LLM_LAYER_ENV_NAMES.get(
-        layer or "",
-        {
-            "api_key": LLM_API_KEY_ENV_NAMES,
-            "base_url": LLM_BASE_URL_ENV_NAMES,
-            "model": LLM_MODEL_ENV_NAMES,
-        },
-    )
-
-    return {
-        "api_key": first_config_value(layer_config, "api_key", env_names["api_key"], ""),
-        "base_url": first_config_value(
-            layer_config,
-            "base_url",
-            env_names["base_url"],
-            LLM_DEFAULT_BASE_URL,
-        ),
-        "model": first_config_value(layer_config, "model", env_names["model"], LLM_DEFAULT_MODEL),
-        "config_path": str(path),
-        "layer": layer or "default",
-    }
-
-
-def load_llm_configs(config_path: str | None = None) -> dict[str, dict[str, Any]]:
-    """读取第一层、第二层和第四层的模型配置。"""
-    return {
-        "review": load_llm_config(config_path, "review"),
-        "classification": load_llm_config(config_path, "classification"),
-        "debug": load_llm_config(config_path, "debug"),
-    }
-
-
-def ensure_llm_config(config: dict[str, Any], purpose: str) -> None:
-    """在未配置模型服务关键参数时终止执行，并给出清晰提示。"""
-    if is_placeholder_api_key(str(config.get("api_key", ""))):
-        raise SystemExit(
-            f"缺少模型服务 API Key，无法{purpose}。请在 {config.get('config_path')} 填写 api_key，"
-            "或设置环境变量 AFTERSALES_AI_API_KEY / OPENAI_API_KEY。"
-        )
-    if is_placeholder_model(str(config.get("model", ""))):
-        raise SystemExit(
-            f"缺少模型名称，无法{purpose}。请在 {config.get('config_path')} 填写 model，"
-            "或设置环境变量 AFTERSALES_AI_MODEL / OPENAI_MODEL。"
-        )
-    if is_placeholder_base_url(str(config.get("base_url", ""))):
-        raise SystemExit(
-            f"缺少 API Base URL，无法{purpose}。请在 {config.get('config_path')} 填写 base_url，"
-            "或设置环境变量 AFTERSALES_AI_BASE_URL / OPENAI_BASE_URL。"
-        )
-
-
-def llm_provider_name(config: dict[str, Any]) -> str:
-    """返回报告中展示的模型名称。"""
-    model = str(config.get("model", "")).strip()
-    return model or "unknown"
-
-
-def layer_llm_config(configs: dict[str, Any], layer: str) -> dict[str, Any]:
-    """兼容单模型配置和分层模型配置。"""
-    layer_config = configs.get(layer)
-    if isinstance(layer_config, dict):
-        return layer_config
-    return configs
-
-
-def call_llm_chat(
-    messages: list[dict[str, str]],
-    config: dict[str, Any],
-    *,
-    temperature: float = 0.2,
-    max_tokens: int | None = None,
-) -> str:
-    """调用 OpenAI-compatible Chat API，并返回模型文本内容。"""
-    ensure_llm_config(config, "调用模型服务")
-    url = str(config.get("base_url", LLM_DEFAULT_BASE_URL)).rstrip("/") + "/chat/completions"
-    payload: dict[str, Any] = {
-        "model": config.get("model", LLM_DEFAULT_MODEL),
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {config['api_key']}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise SystemExit(f"调用模型服务失败: HTTP {exc.code} {detail[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"调用模型服务失败: {exc}") from exc
-
-    data = json.loads(body)
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise SystemExit(f"模型服务返回格式异常: {body[:1000]}") from exc
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(str(item.get("text", "")))
-            else:
-                parts.append(str(item))
-        return "".join(parts)
-    return str(content)
-
-
-def parse_json_object(text: str) -> dict[str, Any]:
-    """从模型回复中提取并解析 JSON 对象，兼容代码块格式。"""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("response does not contain a JSON object")
-    return json.loads(stripped[start : end + 1])
-
-
-def normalize(text: str) -> str:
-    """标准化文本，用于大小写不敏感的检索匹配。"""
-    return text.lower().replace("\\", "/")
-
-
-def extract_terms(text: str) -> set[str]:
-    """从问题和日志中提取基础可检索词。"""
-    lowered = normalize(text)
-    terms = set(re.findall(r"[a-z0-9_./:-]{2,}", lowered))
-    return {term for term in terms if len(term) >= 2}
-
-
-def as_bool(value: Any, default: bool = False) -> bool:
-    """将常见布尔值写法转换为 bool，无法识别时返回默认值。"""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "1", "是"}:
-            return True
-        if lowered in {"false", "no", "0", "否"}:
-            return False
-    return default
-
-
-def as_float(value: Any, default: float = 0.0) -> float:
-    """将值转换为 0.0 到 1.0 范围内的置信度浮点数。"""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    return max(0.0, min(1.0, number))
-
-
-def as_string_list(value: Any) -> list[str]:
-    """将单值或列表值整理成非空字符串列表。"""
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    return [str(value).strip()]
-
-
-def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
-    """当值属于允许的枚举选项时返回该值，否则返回默认值。"""
-    text = str(value or "").strip()
-    return text if text in allowed else default
-
-
-def first_layer_passed(review: dict[str, Any]) -> bool:
-    """判断第一层审查是否允许问题继续进入后续层级。"""
-    return as_bool(review.get("related"))
-
-
-def build_skipped_classification(review: dict[str, Any]) -> dict[str, Any]:
-    """第一层未通过时生成第二层跳过结果，避免继续下探。"""
-    return {
-        "provider": "skipped",
-        "category": "out_of_scope",
-        "difficulty": "ignore_or_manual",
-        "hardware_risk": False,
-        "need_human": False,
-        "hardware_risk_keywords": [],
-        "need_project_context": False,
-        "missing_info": [],
-        "reason": "第一层审查未通过，未进入第二层分类。",
-        "confidence": 0.0,
-    }
-
-
-def merge_triage_layers(
-    review: dict[str, Any],
-    classification: dict[str, Any],
-    scores: dict[str, int],
-) -> dict[str, Any]:
-    """合并第一层审查和第二层分类，生成统一的分流结果。"""
-    allowed_categories = {
-        "hardware_risk",
-        "project_debug",
-        "simple_faq",
-        "robot_general",
-        "out_of_scope",
-    }
-    allowed_difficulties = {"human_review", "complex", "simple", "medium", "ignore_or_manual"}
-
-    related = as_bool(review.get("related"))
-    need_human = as_bool(classification.get("need_human"))
-    hardware_risk = as_bool(classification.get("hardware_risk"))
-    hardware_risk_keywords = as_string_list(classification.get("hardware_risk_keywords"))
-    review_passed = first_layer_passed(review)
-
-    category = normalize_choice(classification.get("category"), allowed_categories, "out_of_scope")
-    difficulty = normalize_choice(classification.get("difficulty"), allowed_difficulties, "ignore_or_manual")
-    need_project_context = as_bool(classification.get("need_project_context"))
-
-    if need_human or hardware_risk:
-        category = "hardware_risk"
-        difficulty = "human_review"
-        need_human = True
-        need_project_context = False
-        related = True
-    elif not related:
-        category = "out_of_scope"
-        difficulty = "ignore_or_manual"
-        need_project_context = False
-
-    review_result = {
-        "provider": str(review.get("provider", "unknown")),
-        "related": related,
-        "reason": str(review.get("reason", "")).strip(),
-        "confidence": as_float(review.get("confidence"), 0.0),
-    }
-    classification_result = {
-        "provider": str(classification.get("provider", "unknown")),
-        "category": category,
-        "difficulty": difficulty,
-        "hardware_risk": hardware_risk,
-        "need_human": need_human,
-        "hardware_risk_keywords": hardware_risk_keywords,
-        "need_project_context": need_project_context,
-        "missing_info": as_string_list(classification.get("missing_info")),
-        "reason": str(classification.get("reason", "")).strip(),
-        "confidence": as_float(classification.get("confidence"), 0.0),
-    }
-
-    return {
-        "related": related,
-        "category": category,
-        "difficulty": difficulty,
-        "need_project_context": need_project_context,
-        "need_human": need_human,
-        "hardware_risk": hardware_risk_keywords,
-        "missing_info": classification_result["missing_info"],
-        "review": review_result,
-        "classification": classification_result,
-        "review_passed": review_passed,
-        "stop_after_review": not review_passed,
-        "scores": scores,
-    }
-
-
-def call_llm_review_layer(
-    question: str,
-    log_text: str,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    """调用便宜模型做第一层相关性审查。"""
-    content = call_llm_chat(
-        [
-            {
-                "role": "system",
-                "content": prompt_template("review_system"),
-            },
-            {
-                "role": "user",
-                "content": render_prompt_template(
-                    "review_user",
-                    {
-                        "question": question.strip() or "无",
-                        "log_text": log_text.strip() or "无",
-                    },
-                ),
-            },
-        ],
-        config,
-        temperature=0.0,
-        max_tokens=500,
-    )
-    data = parse_json_object(content)
-    return {
-        "provider": llm_provider_name(config),
-        "related": as_bool(data.get("related")),
-        "reason": str(data.get("reason", "")).strip(),
-        "confidence": as_float(data.get("confidence"), 0.0),
-    }
-
-
-def call_llm_classification_layer(
-    question: str,
-    log_text: str,
-    review: dict[str, Any],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    """第一层通过后，调用模型服务做第二层处理路径分类。"""
-    content = call_llm_chat(
-        [
-            {
-                "role": "system",
-                "content": prompt_template("classification_system"),
-            },
-            {
-                "role": "user",
-                "content": render_prompt_template(
-                    "classification_user",
-                    {
-                        "review_json": json.dumps(review, ensure_ascii=False),
-                        "question": question.strip() or "无",
-                        "log_text": log_text.strip() or "无",
-                    },
-                ),
-            },
-        ],
-        config,
-        temperature=0.0,
-        max_tokens=700,
-    )
-    data = parse_json_object(content)
-    return {
-        "provider": llm_provider_name(config),
-        "category": data.get("category", "out_of_scope"),
-        "difficulty": data.get("difficulty", "ignore_or_manual"),
-        "hardware_risk": as_bool(data.get("hardware_risk")),
-        "need_human": as_bool(data.get("need_human")),
-        "hardware_risk_keywords": as_string_list(data.get("hardware_risk_keywords")),
-        "need_project_context": as_bool(data.get("need_project_context")),
-        "missing_info": as_string_list(data.get("missing_info")),
-        "reason": str(data.get("reason", "")).strip(),
-        "confidence": as_float(data.get("confidence"), 0.0),
-    }
-
-
-def classify_question(
-    question: str,
-    log_text: str,
-    llm_config: dict[str, Any] | None = None,
-    triage_mode: str = "auto",
-) -> dict[str, Any]:
-    """按配置调用模型服务运行第一层审查和第二层分类。"""
-    if triage_mode not in {"auto", "llm"}:
-        raise SystemExit("不支持的审查分类模式；本地关键词分流已移除，请使用 auto 或 llm。")
-
-    configs = llm_config or load_llm_configs()
-    review_config = layer_llm_config(configs, "review")
-    classification_config = layer_llm_config(configs, "classification")
-
-    try:
-        review = call_llm_review_layer(question, log_text, review_config)
-        if not first_layer_passed(review):
-            return merge_triage_layers(
-                review,
-                build_skipped_classification(review),
-                {},
-            )
-        classification = call_llm_classification_layer(
-            question,
-            log_text,
-            review,
-            classification_config,
-        )
-        return merge_triage_layers(review, classification, {})
-    except (SystemExit, ValueError, json.JSONDecodeError) as exc:
-        if triage_mode == "llm":
-            raise
-        raise SystemExit(f"模型服务审查分类失败: {exc}") from exc
-
-
 def match_faqs(
     question: str,
     log_text: str,
@@ -874,16 +290,21 @@ def should_enter_fourth_layer(
     )
 
 
-def make_debug_prompt(
-    project_name: str,
-    question: str,
-    log_text: str,
-    triage: dict[str, Any],
-    faq_hits: list[dict[str, Any]],
-    debug_rule_1: str | None = None,
-    project_context_note: str | None = None,
-) -> str:
-    """生成发送给项目 Debug 模型层的完整提示词。"""
+def format_review_section(review: dict[str, Any]) -> str:
+    """格式化第一层审查报告段，命令行即时输出和完整报告共用。"""
+    return "\n".join(
+        [
+            "## 第一层审查",
+            f"- 提供方：{review.get('provider', 'unknown')}",
+            f"- 是否通过：{first_layer_passed(review)}",
+            f"- 是否相关：{review.get('related')}",
+            f"- 理由：{review.get('reason', '') or '无'}",
+        ]
+    )
+
+
+def render_faq_section(faq_hits: list[dict[str, Any]]) -> str:
+    """渲染给第四层模型使用的 FAQ 命中详情。"""
     faq_section = "无 FAQ 命中。"
     if faq_hits:
         faq_lines = []
@@ -892,143 +313,7 @@ def make_debug_prompt(
                 f"- {hit.get('title') or hit.get('id')}: {hit.get('answer', '')}"
             )
         faq_section = "\n".join(faq_lines)
-
-    log_section = log_text.strip() or "学生没有提供日志。"
-    missing = "、".join(triage.get("missing_info", [])) or "无"
-    review = triage.get("review", {})
-    classification = triage.get("classification", {})
-
-    return render_prompt_template(
-        "debug_prompt",
-        {
-            "debug_rule_1": debug_rule_1 or prompt_template("debug_rule_standard"),
-            "project_name": project_name,
-            "review_provider": review.get("provider", "unknown"),
-            "review_passed": triage.get("review_passed"),
-            "related": triage.get("related"),
-            "review_reason": review.get("reason", "") or "无",
-            "classification_provider": classification.get("provider", "unknown"),
-            "category": triage.get("category"),
-            "difficulty": triage.get("difficulty"),
-            "hardware_risk": bool(triage.get("hardware_risk")),
-            "need_human": triage.get("need_human"),
-            "need_project_context": triage.get("need_project_context"),
-            "classification_reason": classification.get("reason", "") or "无",
-            "missing_info": missing,
-            "question": question.strip(),
-            "log_text": log_section,
-            "faq_section": faq_section,
-            "project_context_note": project_context_note
-            or "当前流程不再预检索项目代码片段；如果没有项目文件依据，请明确说明需要补充日志、文件名或代码上下文。",
-        },
-    )
-
-
-def make_codex_debug_prompt(
-    project_name: str,
-    question: str,
-    log_text: str,
-    triage: dict[str, Any],
-    faq_hits: list[dict[str, Any]],
-) -> str:
-    """生成给本地 Codex CLI 的提示词，允许它在只读沙盒中自行检索项目文件。"""
-    base_prompt = make_debug_prompt(
-        project_name,
-        question,
-        log_text,
-        triage,
-        faq_hits,
-        debug_rule_1=prompt_template("debug_rule_codex"),
-        project_context_note="当前流程不再预检索项目代码片段；你需要在只读项目目录中自行搜索相关文件。",
-    )
-    return f"{prompt_template('codex_debug_prefix')}\n\n{base_prompt}"
-
-
-def make_report(
-    index_data: dict[str, Any],
-    question: str,
-    log_text: str,
-    triage: dict[str, Any],
-    faq_hits: list[dict[str, Any]],
-    llm_answer: str | None = None,
-) -> str:
-    """渲染一份供售后人员审核的完整 Markdown 诊断报告。"""
-    project_name = index_data.get("project_name", "unknown")
-    enter_fourth_layer = as_bool(
-        triage.get("enter_fourth_layer"),
-        should_enter_fourth_layer(triage, faq_hits),
-    )
-    prompt = ""
-    if enter_fourth_layer:
-        prompt = make_debug_prompt(project_name, question, log_text, triage, faq_hits)
-
-    faq_summary = "无"
-    if faq_hits:
-        lines = []
-        for hit in faq_hits:
-            lines.append(f"- {hit.get('title') or hit.get('id')} (score={hit.get('score')})")
-        faq_summary = "\n".join(lines)
-
-    missing = "、".join(triage.get("missing_info", [])) or "无"
-    action_summary = suggest_action(triage, faq_hits)
-    review = triage.get("review", {})
-    classification = triage.get("classification", {})
-    lines = [
-        "# 售后问题诊断报告",
-        "",
-        f"生成时间：{now_iso()}",
-        f"项目：{project_name}",
-        "",
-        "## 学生问题",
-        question.strip(),
-        "",
-        "## 第一层审查",
-        f"- 提供方：{review.get('provider', 'unknown')}",
-        f"- 是否通过：{triage.get('review_passed')}",
-        f"- 是否相关：{triage.get('related')}",
-        f"- 理由：{review.get('reason', '') or '无'}",
-        "",
-        "## 第二层分类",
-        f"- 提供方：{classification.get('provider', 'unknown')}",
-        f"- 分类：{triage.get('category')}",
-        f"- 难度：{triage.get('difficulty')}",
-        f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
-        f"- 是否建议人工介入：{triage.get('need_human')}",
-        f"- 是否需要项目上下文：{triage.get('need_project_context')}",
-        f"- 理由：{classification.get('reason', '') or '无'}",
-        f"- 缺少信息：{missing}",
-        "",
-        "## 建议处理",
-        action_summary,
-        "",
-        "## 第三层 FAQ 命中",
-        faq_summary,
-        "",
-    ]
-    if triage.get("online_note"):
-        lines.extend(["## 在线分类备注", str(triage.get("online_note")), ""])
-    if enter_fourth_layer:
-        lines.extend(
-            [
-                "## 给第四层模型的诊断提示",
-                "````text",
-                prompt,
-                "````",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "## 第四层模型提示",
-                "当前未进入第四层模型；第一层未通过、FAQ 已覆盖，或第三层没有检索到可用项目上下文。",
-            ]
-        )
-    report = "\n".join(lines)
-
-    if llm_answer:
-        report += "\n\n## 第四层模型回答\n" + llm_answer.strip()
-
-    return report + "\n"
+    return faq_section
 
 
 def suggest_action(
@@ -1050,111 +335,6 @@ def suggest_action(
     ):
         return "建议进入第四层项目 Debug。当前流程不再预检索代码片段；使用 Codex CLI 时会让 Codex 在只读项目目录中自行检索。"
     return "需要售后人员补充更多信息后再判断，优先补充型号、完整日志和复现步骤。"
-
-
-def call_openai_compatible(prompt: str, llm_config: dict[str, Any] | None = None) -> str:
-    """调用配置好的 OpenAI-compatible 接口，生成最终模型诊断文本。"""
-    configs = llm_config or load_llm_configs()
-    config = layer_llm_config(configs, "debug")
-    return call_llm_chat(
-        [
-            {
-                "role": "system",
-                "content": prompt_template("debug_llm_system"),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        config,
-        temperature=0.2,
-    )
-
-
-def resolve_codex_bin(codex_bin: str | None = None) -> str:
-    """按命令行参数、环境变量、PATH 默认值解析 Codex CLI 可执行文件。"""
-    resolved = (codex_bin or os.getenv(CODEX_BIN_ENV_NAME) or CODEX_DEFAULT_BIN).strip()
-    return resolved or CODEX_DEFAULT_BIN
-
-
-def call_codex_cli(
-    prompt: str,
-    *,
-    cwd: Path,
-    codex_bin: str | None = None,
-    timeout_seconds: int = CODEX_DEFAULT_TIMEOUT_SECONDS,
-) -> str:
-    """通过本地 Codex CLI 的非交互模式生成第四层诊断文本。"""
-    if timeout_seconds <= 0:
-        raise SystemExit("--codex-timeout 必须大于 0。")
-    if not cwd.exists() or not cwd.is_dir():
-        raise SystemExit(f"Codex CLI 工作目录不存在或不是文件夹: {cwd}")
-
-    resolved_bin = resolve_codex_bin(codex_bin)
-    output_path: Path | None = None
-
-    def cleanup_output() -> None:
-        if output_path:
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-
-    try:
-        with tempfile.NamedTemporaryFile(prefix="support_ai_codex_", suffix=".md", delete=False) as fh:
-            output_path = Path(fh.name)
-
-        command = [
-            resolved_bin,
-            "exec",
-            "--sandbox",
-            CODEX_SANDBOX_MODE,
-            "-o",
-            str(output_path),
-            "-",
-        ]
-        completed = subprocess.run(
-            command,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            cwd=str(cwd),
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        cleanup_output()
-        raise SystemExit(
-            f"找不到 Codex CLI: {resolved_bin}。请设置 {CODEX_BIN_ENV_NAME} 或传入 --codex-bin。"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        cleanup_output()
-        raise SystemExit(
-            f"调用 Codex CLI 超时（{timeout_seconds} 秒），可增大 --codex-timeout。"
-        ) from exc
-    except OSError as exc:
-        cleanup_output()
-        raise SystemExit(f"调用 Codex CLI 失败: {exc}") from exc
-
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    if completed.returncode != 0:
-        detail = stderr or stdout or f"exit code {completed.returncode}"
-        cleanup_output()
-        raise SystemExit(f"调用 Codex CLI 失败: {detail[:2000]}")
-
-    answer = ""
-    if output_path and output_path.exists():
-        answer = read_text_safe(output_path).strip()
-    cleanup_output()
-    return answer or stdout
-
-
-def append_history(history_path: Path, payload: dict[str, Any]) -> None:
-    """向 JSONL 历史文件追加一条售后案例处理记录。"""
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    with history_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def command_index(args: argparse.Namespace) -> None:
@@ -1188,9 +368,6 @@ def command_inspect(args: argparse.Namespace) -> None:
 
 def command_ask(args: argparse.Namespace) -> None:
     """CLI 的 ask 子命令：分流问题并生成诊断报告。"""
-    if args.call_llm and args.call_codex:
-        raise SystemExit("--call-llm 和 --call-codex 只能选择一个。")
-
     index_data = load_json(Path(args.index), default=None)
     if not index_data:
         raise SystemExit(f"索引不存在: {args.index}")
@@ -1214,48 +391,174 @@ def command_ask(args: argparse.Namespace) -> None:
     if not isinstance(faqs, list):
         raise SystemExit("FAQ 文件必须是 JSON 数组。")
 
-    llm_config = load_llm_configs(args.llm_config)
-    triage = classify_question(
-        question,
-        log_text,
-        llm_config=llm_config,
-        triage_mode=args.triage_mode,
+    project_name = index_data.get("project_name", "unknown")
+    generated_at = now_iso()
+    report_parts = [
+        "\n".join(
+            [
+                "# AI售后 ",
+                "",
+                f"生成时间：{generated_at}",
+                f"项目：{project_name}",
+                "",
+                "## 学生问题",
+                question.strip(),
+            ]
+        )
+    ]
+    print(report_parts[-1], end="\n\n", flush=True)
+
+    llm_config = load_llm_configs(args.llm_config)                              #加载LLM配置
+    review_config = layer_llm_config(llm_config, "review")
+    classification_config = layer_llm_config(llm_config, "classification")
+    try:
+        review = call_llm_review_layer(question, log_text, review_config)       #第一层：审查层
+    except (SystemExit, ValueError) as exc:
+        if args.triage_mode == "llm":
+            raise
+        raise SystemExit(f"模型服务审查分类失败: {exc}") from exc
+
+    review_section = format_review_section(review)
+    report_parts.append(review_section)
+    print(review_section, end="\n\n", flush=True)
+
+    if not first_layer_passed(review):                                          #第一层不通过：输出结果后退出
+        report = "\n\n".join(report_parts) + "\n"
+        if args.out:
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(report, encoding="utf-8")
+            print(f"已生成报告: {out_path}")
+        raise SystemExit(0)
+
+    try:                                            
+        classification = call_llm_classification_layer(                         #第二层：分类层
+            question,
+            log_text,
+            review,
+            classification_config,
+        )
+    except (SystemExit, ValueError) as exc:
+        if args.triage_mode == "llm":
+            raise
+        raise SystemExit(f"模型服务审查分类失败: {exc}") from exc
+
+    category = str(classification.get("category") or "out_of_scope")
+    hardware_risk = as_bool(classification.get("hardware_risk")) or category == "hardware_risk"
+    difficulty = str(classification.get("difficulty") or "ignore_or_manual")
+    need_project_context = as_bool(classification.get("need_project_context"))
+    need_human = as_bool(classification.get("need_human")) or hardware_risk
+    hardware_risk_keywords = list(classification.get("hardware_risk_keywords") or [])
+    if hardware_risk:
+        category = "hardware_risk"
+        difficulty = "human_review"
+        need_project_context = False
+        hardware_risk_keywords = hardware_risk_keywords or ["硬件风险"]
+
+    missing_info = list(classification.get("missing_info") or [])
+    missing_info_text = "、".join(missing_info) or "无"
+    triage = {
+        "related": True,
+        "category": category,
+        "difficulty": difficulty,
+        "need_project_context": need_project_context,
+        "need_human": need_human,
+        "hardware_risk": hardware_risk_keywords,
+        "missing_info": missing_info,
+        "review": review,
+        "classification": classification,
+        "review_passed": True,
+    }
+
+    classification_section = "\n".join(
+        [
+            "## 第二层分类",
+            f"- 提供方：{classification.get('provider', 'unknown')}",
+            f"- 分类：{triage.get('category')}",
+            f"- 难度：{triage.get('difficulty')}",
+            f"- 是否硬件风险：{bool(triage.get('hardware_risk'))}",
+            f"- 是否建议人工介入：{triage.get('need_human')}",
+            f"- 是否需要项目上下文：{triage.get('need_project_context')}",
+            f"- 理由：{classification.get('reason', '') or '无'}",
+            f"- 缺少信息：{missing_info_text}",
+        ]
     )
+    report_parts.append(classification_section)
+    print(classification_section, end="\n\n", flush=True)
 
     faq_hits = []
-    if first_layer_passed(triage.get("review", {})):
-        faq_hits = match_faqs(question, log_text, faqs)
+    faq_hits = match_faqs(question, log_text, faqs)                             #第三层：FAQ
     triage["enter_fourth_layer"] = should_enter_fourth_layer(triage, faq_hits)
 
+    faq_summary = "无"
+    if faq_hits:
+        lines = []
+        for hit in faq_hits:
+            lines.append(f"- {hit.get('title') or hit.get('id')} (score={hit.get('score')})")
+        faq_summary = "\n".join(lines)
+
+    action_section = "\n".join(["## 建议处理", suggest_action(triage, faq_hits)])
+    report_parts.append(action_section)
+    print(action_section, end="\n\n", flush=True)
+
+    faq_report_section = "\n".join(["## 第三层 FAQ 命中", faq_summary])
+    report_parts.append(faq_report_section)
+    print(faq_report_section, end="\n\n", flush=True)
+
+    if triage.get("online_note"):
+        online_section = "\n".join(["## 在线分类备注", str(triage.get("online_note"))])
+        report_parts.append(online_section)
+        print(online_section, end="\n\n", flush=True)
+
     llm_answer = None
-    if (args.call_llm or args.call_codex) and triage["enter_fourth_layer"]:
-        prompt_factory = make_debug_prompt if args.call_llm else make_codex_debug_prompt
+    if triage["enter_fourth_layer"]:
+        prompt_factory = make_codex_debug_prompt if args.call_codex else make_debug_prompt
         prompt = prompt_factory(
-            index_data.get("project_name", "unknown"),
+            project_name,
             question,
             log_text,
             triage,
-            faq_hits,
+            render_faq_section(faq_hits),
         )
-        if args.call_llm:
-            llm_answer = call_openai_compatible(prompt, llm_config)
-        else:
-            llm_answer = call_codex_cli(
+        prompt_section = "\n".join(
+            [
+                "## 给第四层模型的诊断提示",
+                "````text",
+                prompt,
+                "````",
+            ]
+        )
+        report_parts.append(prompt_section)
+        print(prompt_section, end="\n\n", flush=True)
+
+        if args.call_codex:
+            llm_answer = call_codex_cli(                                #第四层：CodexCLI
                 prompt,
                 cwd=Path(index_data["project_root"]),
                 codex_bin=args.codex_bin,
                 timeout_seconds=args.codex_timeout,
             )
+        if llm_answer:
+            answer_section = "## 第四层模型回答\n" + llm_answer.strip()
+            report_parts.append(answer_section)
+            print(answer_section, end="\n\n", flush=True)
+    else:
+        fourth_section = "\n".join(
+            [
+                "## 第四层模型提示",
+                "当前未进入第四层模型；第一层未通过、FAQ 已覆盖，或第三层没有检索到可用项目上下文。",
+            ]
+        )
+        report_parts.append(fourth_section)
+        print(fourth_section, end="\n\n", flush=True)
 
-    report = make_report(index_data, question, log_text, triage, faq_hits, llm_answer)
+    report = "\n\n".join(report_parts) + "\n"
 
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report, encoding="utf-8")
         print(f"已生成报告: {out_path}")
-    else:
-        print(report)
 
     if args.history:
         append_history(
@@ -1311,7 +614,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="两层审查分类模式；本地关键词分流已移除，auto 和 llm 都需要模型服务 Key",
     )
-    ask_parser.add_argument("--call-llm", action="store_true", help="调用模型服务生成第四层诊断回答")
     ask_parser.add_argument("--call-codex", action="store_true", help="调用本地 Codex CLI 生成第四层诊断回答")
     ask_parser.add_argument(
         "--codex-bin",

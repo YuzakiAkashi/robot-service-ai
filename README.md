@@ -44,7 +44,7 @@ topic 没有输出
 - 第一层 AI 相关性审查，可配置便宜模型
 - 第二层 AI 安全判断和分类，可配置更强模型
 - 第三层 FAQ 匹配
-- 第四层项目 Debug 模型提示与回答；使用 Codex CLI 时支持只读项目检索
+- 第四层项目 Debug 提示；使用 Codex CLI 时支持只读项目检索和回答
 - 生成 Markdown 诊断报告
 - 生成可交给 AI 服务、Codex 或其他代码模型的 Debug Prompt
 - 支持历史记录 JSONL
@@ -161,11 +161,6 @@ python support_ai.py ask `
     "api_key": "替换成第二层 API Key",
     "base_url": "https://classification-provider.example.com/api/v1",
     "model": "your-strong-classification-model"
-  },
-  "debug": {
-    "api_key": "替换成第四层 API Key",
-    "base_url": "https://debug-provider.example.com/api/v1",
-    "model": "your-debug-model"
   }
 }
 ```
@@ -179,9 +174,6 @@ $env:AFTERSALES_REVIEW_AI_MODEL="your-cheap-review-model"
 $env:AFTERSALES_CLASSIFICATION_AI_API_KEY="第二层 API Key"
 $env:AFTERSALES_CLASSIFICATION_AI_BASE_URL="https://classification-provider.example.com/api/v1"
 $env:AFTERSALES_CLASSIFICATION_AI_MODEL="your-strong-classification-model"
-$env:AFTERSALES_DEBUG_AI_API_KEY="第四层 API Key"
-$env:AFTERSALES_DEBUG_AI_BASE_URL="https://debug-provider.example.com/api/v1"
-$env:AFTERSALES_DEBUG_AI_MODEL="your-debug-model"
 ```
 
 `ask` 默认使用 `--triage-mode auto` 调用模型服务完成第一层审查和第二层分类；本地关键词分流已移除，因此必须配置模型服务 Key。显式使用模型服务：
@@ -193,17 +185,6 @@ python support_ai.py ask `
   --log-file samples/cases/lidar_permission_log.txt `
   --triage-mode llm `
   --out reports/llm_triage.md
-```
-
-需要模型服务继续生成第四层诊断回答时，加上 `--call-llm`：
-
-```powershell
-python support_ai.py ask `
-  --index indexes/mini_robot.json `
-  --question-file samples/cases/lidar_permission_question.txt `
-  --log-file samples/cases/lidar_permission_log.txt `
-  --call-llm `
-  --out reports/llm_answer.md
 ```
 
 ## 用在真实功能包
