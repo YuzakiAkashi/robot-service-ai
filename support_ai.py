@@ -39,6 +39,8 @@ from support_utils import (
 
 
 SCHEMA_VERSION = 1
+WEB_FRONTEND_BEGIN_MARKER = "__SUPPORT_AI_FRONTEND_BEGIN__"
+WEB_FRONTEND_END_MARKER = "__SUPPORT_AI_FRONTEND_END__"
 
 IGNORED_DIRS = {
     ".git",
@@ -316,6 +318,12 @@ def render_faq_section(faq_hits: list[dict[str, Any]]) -> str:
     return faq_section
 
 
+def print_web_frontend_marker(args: argparse.Namespace, marker: str) -> None:
+    """仅供 web_app.py 分流输出使用；普通 CLI 不会打印。"""
+    if getattr(args, "web_stream_split", False):
+        print(marker, flush=True)
+
+
 def suggest_action(
     triage: dict[str, Any],
     faq_hits: list[dict[str, Any]],
@@ -411,6 +419,7 @@ def command_ask(args: argparse.Namespace) -> None:
     llm_config = load_llm_configs(args.llm_config)                              #加载LLM配置
     review_config = layer_llm_config(llm_config, "review")
     classification_config = layer_llm_config(llm_config, "classification")
+    print("## 运行进度\n- 正在进行第一层审查...\n", flush=True)
     try:
         review = call_llm_review_layer(question, log_text, review_config)       #第一层：审查层
     except (SystemExit, ValueError) as exc:
@@ -431,6 +440,7 @@ def command_ask(args: argparse.Namespace) -> None:
             print(f"已生成报告: {out_path}")
         raise SystemExit(0)
 
+    print("## 运行进度\n- 正在进行第二层分类...\n", flush=True)
     try:                                            
         classification = call_llm_classification_layer(                         #第二层：分类层
             question,
@@ -486,6 +496,7 @@ def command_ask(args: argparse.Namespace) -> None:
     report_parts.append(classification_section)
     print(classification_section, end="\n\n", flush=True)
 
+    print_web_frontend_marker(args, WEB_FRONTEND_BEGIN_MARKER)
     print("## 运行进度\n- 正在匹配第三层 FAQ...\n", flush=True)
     faq_hits = []
     faq_hits = match_faqs(question, log_text, faqs)                             #第三层：FAQ
@@ -552,6 +563,8 @@ def command_ask(args: argparse.Namespace) -> None:
         report_parts.append(fourth_section)
         print(fourth_section, end="\n\n", flush=True)
 
+    print_web_frontend_marker(args, WEB_FRONTEND_END_MARKER)
+
     report = "\n\n".join(report_parts) + "\n"
 
     if args.out:
@@ -615,6 +628,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="两层审查分类模式；本地关键词分流已移除，auto 和 llm 都需要模型服务 Key",
     )
     ask_parser.add_argument("--call-codex", action="store_true", help="调用本地 Codex CLI 生成第四层诊断回答")
+    ask_parser.add_argument(
+        "--web-stream-split",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     ask_parser.add_argument(
         "--codex-bin",
         help=f"Codex CLI 可执行文件路径；默认读取 {CODEX_BIN_ENV_NAME}，否则使用 PATH 中的 codex",

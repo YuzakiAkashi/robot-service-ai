@@ -31,6 +31,7 @@ LLM_DEFAULT_MODEL = "your-model-name"
 CODEX_BIN_ENV_NAME = "CODEX_BIN"
 CODEX_DEFAULT_BIN = "codex"
 CODEX_SANDBOX_MODE = "read-only"
+CODEX_REASONING_EFFORT = "low"
 CODEX_DEFAULT_TIMEOUT_SECONDS = 600
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompts" / "ai_prompts.md"
 LLM_API_KEY_ENV_NAMES = ("AFTERSALES_AI_API_KEY", "OPENAI_API_KEY")
@@ -421,6 +422,8 @@ def call_codex_cli(
             "exec",
             "--sandbox",
             CODEX_SANDBOX_MODE,
+            "-c",
+            f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
             "-o",
             str(output_path),
             "-",

@@ -12,6 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from support_ai import WEB_FRONTEND_BEGIN_MARKER, WEB_FRONTEND_END_MARKER
+
 
 ROOT = Path(__file__).resolve().parent
 TMP_DIR = ROOT / "reports" / "_web_tmp"
@@ -385,9 +387,9 @@ HTML = """<!doctype html>
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       submitBtn.disabled = true;
-      status.textContent = '正在分析...';
+      status.textContent = '正在分析... 前两层输出在终端，第三/第四层显示在这里。';
       status.className = 'status';
-      output.innerHTML = '';
+      output.textContent = '等待第三层/第四层输出...';
 
       const data = Object.fromEntries(new FormData(form).entries());
       if (saveQuestion.checked) {
@@ -444,7 +446,11 @@ HTML = """<!doctype html>
           fullText += tail;
         }
         paintPlain(true);
-        output.innerHTML = renderMarkdown(fullText);
+        if (fullText.trim()) {
+          output.innerHTML = renderMarkdown(fullText);
+        } else {
+          output.textContent = '本次没有第三层/第四层输出，其他内容请看终端。';
+        }
         output.scrollTop = output.scrollHeight;
         if (response.ok && !fullText.includes('[前端] 执行失败')) {
           status.textContent = '完成';
@@ -522,6 +528,7 @@ class Handler(BaseHTTPRequestHandler):
             "--out",
             out_path,
             "--call-codex",
+            "--web-stream-split",
         ]
         return command, out_path
 
@@ -542,27 +549,64 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        line_buffer = ""
+        in_frontend = False
+
+        def write_routed(text: str) -> None:
+            if in_frontend:
+                self._write_text(text)
+            else:
+                self._write_terminal(text)
+
+        def route_line(line: str) -> None:
+            nonlocal in_frontend
+            stripped = line.strip()
+            if stripped == WEB_FRONTEND_BEGIN_MARKER:
+                in_frontend = True
+                return
+            if stripped == WEB_FRONTEND_END_MARKER:
+                in_frontend = False
+                return
+            write_routed(line)
+
+        def route_output(text: str) -> None:
+            nonlocal line_buffer
+            if not text:
+                return
+            line_buffer += text
+            while "\n" in line_buffer:
+                line, line_buffer = line_buffer.split("\n", 1)
+                route_line(line + "\n")
+
         if process.stdout is not None:
             fd = process.stdout.fileno()
             while True:
                 chunk = os.read(fd, 512)
                 if not chunk:
                     break
-                self._write_text(decoder.decode(chunk))
+                route_output(decoder.decode(chunk))
         tail = decoder.decode(b"", final=True)
         if tail:
-            self._write_text(tail)
+            route_output(tail)
+        if line_buffer:
+            route_line(line_buffer)
         returncode = process.wait()
         if returncode == 0:
-            self._write_text(f"\n[前端] 执行完成，报告已保存：{out_path}\n")
+            self._write_terminal(f"\n[web_app] 执行完成，报告已保存：{out_path}\n")
         else:
-            self._write_text(f"\n[前端] 执行失败，退出码 {returncode}\n")
+            self._write_terminal(f"\n[web_app] 执行失败，退出码 {returncode}\n")
 
     def _write_text(self, text: str) -> None:
         if not text:
             return
         self.wfile.write(text.encode("utf-8", errors="replace"))
         self.wfile.flush()
+
+    def _write_terminal(self, text: str) -> None:
+        if not text or sys.stdout is None:
+            return
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
     def _send_text(self, text: str, status: int = 200) -> None:
         body = text.encode("utf-8", errors="replace")
